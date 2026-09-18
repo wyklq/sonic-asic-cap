@@ -36,6 +36,9 @@ extern "C" {
 /* Pure, unit-testable helpers (status/enum formatting). */
 #include "cap_logic.h"
 
+/* Dependency-free JSON builder for --format json. */
+#include "json_value.h"
+
 /*
  * libsairedis provides these serializers through libsaimeta, but the public
  * packaging does not install <sai_serialize.h>. Declaring the two functions
@@ -65,6 +68,21 @@ std::string sai_serialize_status(sai_status_t status);
 namespace {
 
 using namespace cap;
+
+/* json_value.h lives in namespace cap as well. */
+using cap::JsonValue;
+
+std::string
+format_object_id_hex(sai_object_id_t object_id)
+{
+    char buffer[32];
+    std::snprintf(
+        buffer,
+        sizeof(buffer),
+        "0x%" PRIx64,
+        static_cast<uint64_t>(object_id));
+    return std::string(buffer);
+}
 
 /* Thin adapters over cap:: so call sites read naturally with SAI types. */
 bool
@@ -106,6 +124,7 @@ struct Options
     bool server_mode = false;
     bool allow_clear = false;
     bool verify_attributes = false;
+    std::string format = "text";
     std::string object_filter;
     std::string client_config;
     std::string context_config;
@@ -755,25 +774,35 @@ struct SupportedObjectTypes
     }
 };
 
-SupportedObjectTypes
+struct SupportedObjectTypesQuery
+{
+    SupportedObjectTypes supported;
+    FetchOutcome outcome;
+    bool metadata_present = false;
+};
+
+/*
+ * Query the authoritative supported object type list. Printing is left to the
+ * caller so the text and JSON reporters can share this logic.
+ */
+SupportedObjectTypesQuery
 query_supported_object_types(
     sai_object_id_t switch_id,
     const sai_switch_api_t *switch_api)
 {
-    SupportedObjectTypes supported;
+    SupportedObjectTypesQuery result;
     const sai_attr_metadata_t *metadata =
         find_attribute("SAI_SWITCH_ATTR_SUPPORTED_OBJECT_TYPE_LIST");
 
-    std::printf("\n=== Supported object types ===\n");
-
     if (metadata == nullptr) {
-        std::printf("Metadata does not contain SUPPORTED_OBJECT_TYPE_LIST\n");
-        return supported;
+        result.outcome.detail = "metadata missing";
+        return result;
     }
+    result.metadata_present = true;
 
     sai_attribute_t attribute{};
     AttributeStorage storage;
-    const FetchOutcome outcome = fetch_attribute(
+    result.outcome = fetch_attribute(
         metadata,
         [switch_api, switch_id](sai_attribute_t *value) {
             return switch_api->get_switch_attribute(
@@ -784,22 +813,41 @@ query_supported_object_types(
         attribute,
         storage);
 
-    std::printf("status=%s", format_status(outcome.status).c_str());
-    if (!outcome.detail.empty()) {
-        std::printf(" detail=%s", outcome.detail.c_str());
+    if (result.outcome.result != FetchKind::Ok) {
+        return result;
+    }
+
+    result.supported.authoritative = true;
+    for (uint32_t index = 0; index < attribute.value.s32list.count; ++index) {
+        result.supported.types.insert(attribute.value.s32list.list[index]);
+    }
+
+    return result;
+}
+
+void
+print_supported_object_types(const SupportedObjectTypesQuery &query)
+{
+    const SupportedObjectTypes &supported = query.supported;
+
+    std::printf("\n=== Supported object types ===\n");
+
+    if (!query.metadata_present) {
+        std::printf("Metadata does not contain SUPPORTED_OBJECT_TYPE_LIST\n");
+        return;
+    }
+
+    std::printf("status=%s", format_status(query.outcome.status).c_str());
+    if (!query.outcome.detail.empty()) {
+        std::printf(" detail=%s", query.outcome.detail.c_str());
     }
     std::printf("\n");
 
-    if (outcome.result != FetchKind::Ok) {
+    if (!supported.authoritative) {
         std::printf(
             "The adapter did not expose an authoritative object list; "
             "object type verdicts will be reported as unknown.\n");
-        return supported;
-    }
-
-    supported.authoritative = true;
-    for (uint32_t index = 0; index < attribute.value.s32list.count; ++index) {
-        supported.types.insert(attribute.value.s32list.list[index]);
+        return;
     }
 
     size_t position = 0;
@@ -825,8 +873,6 @@ query_supported_object_types(
                 static_cast<uint32_t>(raw));
         }
     }
-
-    return supported;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2805,6 +2851,408 @@ probe_live_stats(
 }
 
 /* ------------------------------------------------------------------ */
+/* JSON report                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Build the machine-readable report.
+ *
+ * This reuses the same pure query helpers as the text path, so the two
+ * formats cannot disagree about what was asked. Unlike the text output, JSON
+ * mode does not truncate or cap anything: consumers are expected to filter,
+ * and silently dropping data would be worse than a large document.
+ */
+JsonValue
+build_json_report(
+    const Options &options,
+    sai_object_id_t requested_switch,
+    Transport transport,
+    const SupportedObjectTypesQuery &supported_query,
+    const sai_switch_api_t *switch_api,
+    StatsCapabilityCache &stats_cache)
+{
+    JsonValue root = JsonValue::make_object();
+
+    root.set("tool", JsonValue::make_string("sai_cap_query"));
+    root.set(
+        "schema_version",
+        JsonValue::make_uint(1));
+    root.set(
+        "compiled_sai_version",
+        JsonValue::make_string(format_api_version(SAI_API_VERSION)));
+    root.set(
+        "linked_metadata_version",
+        JsonValue::make_string(
+            format_api_version(sai_metadata_query_api_version())));
+    root.set(
+        "switch_vid",
+        JsonValue::make_string(
+            format_object_id_hex(requested_switch)));
+    root.set(
+        "transport",
+        JsonValue::make_string(
+            transport == Transport::Client ? "client" : "server"));
+    root.set(
+        "object_filter",
+        JsonValue::make_string(options.object_filter));
+    root.set("all", JsonValue::make_bool(options.all));
+    root.set(
+        "include_unsupported",
+        JsonValue::make_bool(options.include_unsupported));
+    root.set("probe_stats", JsonValue::make_bool(options.probe_stats));
+    root.set(
+        "verify_attributes",
+        JsonValue::make_bool(options.verify_attributes));
+
+    /* Supported object types. */
+    const SupportedObjectTypes &supported = supported_query.supported;
+    JsonValue supported_json = JsonValue::make_object();
+    supported_json.set(
+        "authoritative",
+        JsonValue::make_bool(supported.authoritative));
+    supported_json.set(
+        "status",
+        JsonValue::make_string(
+            format_status(supported_query.outcome.status)));
+    if (!supported_query.outcome.detail.empty()) {
+        supported_json.set(
+            "detail",
+            JsonValue::make_string(supported_query.outcome.detail));
+    }
+    JsonValue type_array = JsonValue::make_array();
+    for (int32_t raw : supported.types) {
+        const sai_object_type_info_t *info =
+            sai_metadata_get_object_type_info(
+                static_cast<sai_object_type_t>(raw));
+        JsonValue entry = JsonValue::make_object();
+        entry.set("value", JsonValue::make_int(raw));
+        entry.set(
+            "name",
+            JsonValue::make_string(
+                info != nullptr
+                    ? info->objecttypename
+                    : classify_unknown_value(raw)));
+        entry.set(
+            "in_local_metadata",
+            JsonValue::make_bool(info != nullptr));
+        if (info != nullptr) {
+            entry.set(
+                "experimental",
+                JsonValue::make_bool(info->isexperimental));
+            entry.set(
+                "vendor_custom",
+                JsonValue::make_bool(info->iscustom));
+        }
+        type_array.push(std::move(entry));
+    }
+    supported_json.set("types", std::move(type_array));
+    root.set("supported_object_types", std::move(supported_json));
+
+    /* Switch attributes (read-only sweep when --all). */
+    {
+        std::vector<const sai_attr_metadata_t *> attributes;
+        const sai_object_type_info_t *switch_info =
+            sai_metadata_get_object_type_info(SAI_OBJECT_TYPE_SWITCH);
+        if (switch_info != nullptr) {
+            for (size_t i = 0;
+                 switch_info->attrmetadata[i] != nullptr;
+                 ++i) {
+                const sai_attr_metadata_t *metadata =
+                    switch_info->attrmetadata[i];
+                if (!options.all || metadata->isreadonly) {
+                    attributes.push_back(metadata);
+                }
+            }
+        }
+
+        JsonValue attributes_json = JsonValue::make_array();
+        for (const sai_attr_metadata_t *metadata : attributes) {
+            if (metadata == nullptr) {
+                continue;
+            }
+            sai_attribute_t attribute{};
+            AttributeStorage storage;
+            const FetchOutcome outcome = fetch_attribute(
+                metadata,
+                [switch_api, requested_switch](sai_attribute_t *value) {
+                    return switch_api->get_switch_attribute(
+                        requested_switch, 1, value);
+                },
+                attribute,
+                storage);
+
+            JsonValue entry = JsonValue::make_object();
+            entry.set(
+                "name", JsonValue::make_string(metadata->attridname));
+            entry.set(
+                "result",
+                JsonValue::make_string(
+                    summary_bucket(outcome.result, outcome.status)));
+            entry.set(
+                "status",
+                JsonValue::make_string(format_status(outcome.status)));
+            if (!outcome.detail.empty()) {
+                entry.set(
+                    "detail",
+                    JsonValue::make_string(outcome.detail));
+            }
+            if (outcome.result == FetchKind::Ok) {
+                entry.set(
+                    "value",
+                    JsonValue::make_string(
+                        serialize_attribute(metadata, attribute)));
+            }
+            entry.set(
+                "read_only",
+                JsonValue::make_bool(metadata->isreadonly));
+            entry.set(
+                "deprecated",
+                JsonValue::make_bool(metadata->isdeprecated));
+            attributes_json.push(std::move(entry));
+        }
+        root.set("switch_attributes", std::move(attributes_json));
+    }
+
+    /*
+     * Attribute capability declarations.
+     *
+     * This is the most expensive section (one round trip per attribute in the
+     * whole schema). Mirror the text path: scan everything only with --all or
+     * an --object filter, otherwise restrict to the focused object types.
+     */
+    {
+        static const sai_object_type_t focused_types[] = {
+            SAI_OBJECT_TYPE_PORT,
+            SAI_OBJECT_TYPE_QUEUE,
+            SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP,
+            SAI_OBJECT_TYPE_ROUTER_INTERFACE,
+            SAI_OBJECT_TYPE_SWITCH,
+        };
+        const bool full_scan =
+            options.all || !options.object_filter.empty();
+
+        JsonValue capabilities_json = JsonValue::make_array();
+        const std::string &filter = options.object_filter;
+        for (size_t i = 1;
+             sai_metadata_all_object_type_infos[i] != nullptr;
+             ++i) {
+            const sai_object_type_info_t *info =
+                sai_metadata_all_object_type_infos[i];
+            if (!object_name_matches(info->objecttypename, filter)) {
+                continue;
+            }
+            if (!full_scan) {
+                bool focused = false;
+                for (sai_object_type_t type : focused_types) {
+                    if (type == info->objecttype) {
+                        focused = true;
+                        break;
+                    }
+                }
+                if (!focused) {
+                    continue;
+                }
+            }
+            const bool asic_supported =
+                supported.authoritative &&
+                supported.is_supported(info->objecttype);
+            for (size_t j = 0;
+                 info->attrmetadata[j] != nullptr;
+                 ++j) {
+                const sai_attr_metadata_t *metadata =
+                    info->attrmetadata[j];
+                sai_attr_capability_t capability{};
+                sai_status_t status = SAI_STATUS_FAILURE;
+                try {
+                    status = sai_query_attribute_capability(
+                        requested_switch,
+                        metadata->objecttype,
+                        metadata->attrid,
+                        &capability);
+                } catch (const std::exception &) {
+                    status = SAI_STATUS_FAILURE;
+                }
+
+                JsonValue entry = JsonValue::make_object();
+                entry.set(
+                    "object_type",
+                    JsonValue::make_string(info->objecttypename));
+                entry.set(
+                    "asic_supported",
+                    JsonValue::make_bool(asic_supported));
+                entry.set(
+                    "name",
+                    JsonValue::make_string(metadata->attridname));
+                entry.set(
+                    "status",
+                    JsonValue::make_string(format_status(status)));
+                if (status == SAI_STATUS_SUCCESS) {
+                    entry.set(
+                        "create_implemented",
+                        JsonValue::make_bool(capability.create_implemented));
+                    entry.set(
+                        "set_implemented",
+                        JsonValue::make_bool(capability.set_implemented));
+                    entry.set(
+                        "get_implemented",
+                        JsonValue::make_bool(capability.get_implemented));
+                }
+                entry.set(
+                    "conditional",
+                    JsonValue::make_bool(metadata->isconditional));
+                entry.set(
+                    "valid_only",
+                    JsonValue::make_bool(metadata->isvalidonly));
+                entry.set(
+                    "deprecated",
+                    JsonValue::make_bool(metadata->isdeprecated));
+                capabilities_json.push(std::move(entry));
+            }
+        }
+        root.set(
+            "attribute_capabilities",
+            std::move(capabilities_json));
+    }
+
+    /* Statistics capabilities. */
+    {
+        JsonValue stats_json = JsonValue::make_array();
+        for (size_t i = 1;
+             sai_metadata_all_object_type_infos[i] != nullptr;
+             ++i) {
+            const sai_object_type_info_t *info =
+                sai_metadata_all_object_type_infos[i];
+            if (info->statenum == nullptr ||
+                !object_name_matches(info->objecttypename, options.object_filter)) {
+                continue;
+            }
+            if (supported.authoritative &&
+                !supported.is_supported(info->objecttype)) {
+                continue;
+            }
+
+            const StatsCapabilityResult &result = stats_cache.get(info);
+            const StatsStCapabilityResult st_result =
+                query_stats_st_capability(
+                    requested_switch, info);
+
+            JsonValue entry = JsonValue::make_object();
+            entry.set(
+                "object_type",
+                JsonValue::make_string(info->objecttypename));
+            entry.set(
+                "status",
+                JsonValue::make_string(format_status(result.status)));
+
+            JsonValue counters = JsonValue::make_array();
+            for (const auto &value : result.values) {
+                const int32_t stat = value.stat_enum;
+                JsonValue counter = JsonValue::make_object();
+                counter.set("value", JsonValue::make_int(stat));
+                counter.set(
+                    "name",
+                    JsonValue::make_string(
+                        format_enum_value(info->statenum, stat)));
+                counter.set(
+                    "modes_raw",
+                    JsonValue::make_uint(value.stat_modes));
+                counter.set(
+                    "modes",
+                    JsonValue::make_string(
+                        format_stats_modes(value.stat_modes)));
+                counters.push(std::move(counter));
+            }
+            entry.set("counters", std::move(counters));
+
+            JsonValue st_json = JsonValue::make_object();
+            st_json.set(
+                "status",
+                JsonValue::make_string(format_status(st_result.status)));
+            JsonValue st_counters = JsonValue::make_array();
+            for (const auto &value : st_result.values) {
+                JsonValue counter = JsonValue::make_object();
+                counter.set(
+                    "value",
+                    JsonValue::make_int(value.capability.stat_enum));
+                counter.set(
+                    "name",
+                    JsonValue::make_string(
+                        format_enum_value(
+                            info->statenum,
+                            value.capability.stat_enum)));
+                counter.set(
+                    "modes_raw",
+                    JsonValue::make_uint(
+                        value.capability.stat_modes));
+                counter.set(
+                    "minimal_polling_interval_ns",
+                    JsonValue::make_uint(
+                        value.minimal_polling_interval));
+                st_counters.push(std::move(counter));
+            }
+            st_json.set("counters", std::move(st_counters));
+            entry.set("stream_telemetry", std::move(st_json));
+
+            stats_json.push(std::move(entry));
+        }
+        root.set("statistics_capabilities", std::move(stats_json));
+    }
+
+    /* Generic resource availability. */
+    {
+        JsonValue availability_json = JsonValue::make_array();
+        for (size_t i = 1;
+             sai_metadata_all_object_type_infos[i] != nullptr;
+             ++i) {
+            const sai_object_type_info_t *info =
+                sai_metadata_all_object_type_infos[i];
+            if (!object_name_matches(info->objecttypename, options.object_filter)) {
+                continue;
+            }
+            if (supported.authoritative &&
+                !supported.is_supported(info->objecttype)) {
+                continue;
+            }
+
+            uint64_t count = 0;
+            sai_status_t status = SAI_STATUS_FAILURE;
+            try {
+                status = sai_object_type_get_availability(
+                    requested_switch,
+                    info->objecttype,
+                    0,
+                    nullptr,
+                    &count);
+            } catch (const std::exception &) {
+                status = SAI_STATUS_FAILURE;
+            }
+
+            JsonValue entry = JsonValue::make_object();
+            entry.set(
+                "object_type",
+                JsonValue::make_string(info->objecttypename));
+            entry.set(
+                "discriminator",
+                JsonValue::make_string(""));
+            entry.set(
+                "status",
+                JsonValue::make_string(format_status(status)));
+            if (status == SAI_STATUS_SUCCESS) {
+                entry.set(
+                    "available",
+                    JsonValue::make_uint(count));
+            }
+            availability_json.push(std::move(entry));
+        }
+        root.set(
+            "resource_availability",
+            std::move(availability_json));
+    }
+
+    return root;
+}
+
+/* ------------------------------------------------------------------ */
 /* service method table / profile                                      */
 /* ------------------------------------------------------------------ */
 
@@ -2899,6 +3347,7 @@ print_usage(const char *program)
         "  --probe-stats             Read-test every known stat on sample live objects\n"
         "  --allow-clear             Also probe READ_AND_CLEAR modes (mutates counters)\n"
         "  --verify-attributes       Real GET for every declared-gettable attribute\n"
+        "  --format text|json        Output format (default text)\n"
         "  --list-switches           Validate and describe the supplied switch VID\n"
         "  --client                  Connect to running syncd (default)\n"
         "  --server                  Become a sairedis server (use only without syncd)\n"
@@ -2947,6 +3396,26 @@ parse_options(int argc, char **argv, Options &options)
             options.allow_clear = true;
         } else if (argument == "--verify-attributes") {
             options.verify_attributes = true;
+        } else if (argument == "--format") {
+            if (!need_value(index, "--format", options.format)) {
+                return false;
+            }
+            if (options.format != "text" && options.format != "json") {
+                std::fprintf(
+                    stderr,
+                    "Invalid --format '%s' (expected text or json)\n",
+                    options.format.c_str());
+                return false;
+            }
+        } else if (argument.rfind("--format=", 0) == 0) {
+            options.format = argument.substr(std::strlen("--format="));
+            if (options.format != "text" && options.format != "json") {
+                std::fprintf(
+                    stderr,
+                    "Invalid --format '%s' (expected text or json)\n",
+                    options.format.c_str());
+                return false;
+            }
         } else if (argument == "--list-switches") {
             options.list_switches = true;
         } else if (argument == "--client") {
@@ -3092,29 +3561,40 @@ main(int argc, char **argv)
         return 1;
     }
 
-    std::printf(
+    const bool json_output = options.format == "json";
+
+    /* In JSON mode all human-readable preamble goes to stderr, so stdout
+     * carries exactly one JSON document and nothing else. */
+    FILE *const banner = json_output ? stderr : stdout;
+    std::fprintf(
+        banner,
         "Switch VID: 0x%" PRIx64 "\n",
         static_cast<uint64_t>(requested_switch));
-    std::printf(
+    std::fprintf(
+        banner,
         "Transport: %s\n",
         state->transport == Transport::Client
             ? "client (connect to running syncd)"
             : "server (this process owns the sairedis endpoint)");
     if (state->transport == Transport::Server) {
-        std::printf(
+        std::fprintf(
+            banner,
             "WARNING: server mode shares the synchronous response queue with "
             "any other client and must not be used while syncd is running.\n");
     }
 
-    std::printf("\n=== Version context ===\n");
-    std::printf(
+    std::fprintf(banner, "\n=== Version context ===\n");
+    std::fprintf(
+        banner,
         "Compiled SAI headers: %s\n",
         format_api_version(SAI_API_VERSION).c_str());
-    std::printf(
+    std::fprintf(
+        banner,
         "Linked metadata:      %s\n",
         format_api_version(
             sai_metadata_query_api_version()).c_str());
-    std::printf(
+    std::fprintf(
+        banner,
         "NOTE: 'Linked metadata' is what libsaimetadata was compiled with; it "
         "reflects the tool build, not the adapter's own metadata. Vendor\n"
         "      private attributes absent from these headers cannot appear in "
@@ -3126,20 +3606,25 @@ main(int argc, char **argv)
     } catch (const std::exception &) {
         status = SAI_STATUS_FAILURE;
     }
-    std::printf(
+    std::fprintf(
+        banner,
         "Advisory query:       status=%s",
         format_status(status).c_str());
     if (status == SAI_STATUS_SUCCESS) {
-        std::printf(
+        std::fprintf(
+            banner,
             " version=%s",
             format_api_version(queried_version).c_str());
     }
-    std::printf("\n");
-    std::printf(
+    std::fprintf(banner, "\n");
+    std::fprintf(
+        banner,
         "NOTE: sairedis answers this with its own client-header version, so it "
         "is advisory only and does not identify the remote vendor libsai.\n");
 
-    print_metadata_inventory();
+    if (!json_output) {
+        print_metadata_inventory();
+    }
 
     void *api_table = nullptr;
     status = sai_api_query(SAI_API_SWITCH, &api_table);
@@ -3199,7 +3684,8 @@ main(int argc, char **argv)
             return 3;
         }
 
-        std::printf(
+        std::fprintf(
+            banner,
             "\nSwitch VID validation: OK (SAI_SWITCH_ATTR_TYPE=%s)\n",
             format_enum_value(
                 type_metadata->enummetadata,
@@ -3227,12 +3713,14 @@ main(int argc, char **argv)
                 timeout_status = SAI_STATUS_FAILURE;
             }
 
-            std::printf(
+            std::fprintf(
+                banner,
                 "Sync timeout: %s (requested %" PRIu64 " ms)\n",
                 format_status(timeout_status).c_str(),
                 options.response_timeout_ms);
         } else {
-            std::printf(
+            std::fprintf(
+                banner,
                 "Sync timeout: NOT APPLIED (--timeout-ms=%" PRIu64 "). "
                 "libsairedis rejects extension attributes in client mode; "
                 "use the default 60s timeout or run with --server.\n",
@@ -3240,8 +3728,39 @@ main(int argc, char **argv)
         }
     }
 
-    const SupportedObjectTypes supported =
+    const SupportedObjectTypesQuery supported_query =
         query_supported_object_types(requested_switch, switch_api);
+
+    if (json_output) {
+        /*
+         * JSON mode emits exactly one document on stdout. The live probe and
+         * attribute verification are documented limitations of this mode
+         * because they emit per-counter line output; run text mode for those.
+         */
+        StatsCapabilityCache json_stats_cache(requested_switch);
+        const JsonValue report = build_json_report(
+            options,
+            requested_switch,
+            state->transport,
+            supported_query,
+            switch_api,
+            json_stats_cache);
+        if (options.probe_stats || options.verify_attributes) {
+            std::fprintf(
+                stderr,
+                "WARNING: --probe-stats and --verify-attributes produce "
+                "line-oriented output and are not included in --format json. "
+                "Run text mode for those.\n");
+        }
+        const std::string document = report.dump();
+        std::fwrite(
+            document.data(), 1, document.size(), stdout);
+        sai_api_uninitialize();
+        return 0;
+    }
+
+    print_supported_object_types(supported_query);
+    const SupportedObjectTypes &supported = supported_query.supported;
 
     if (options.list_switches) {
         const std::string type_count = supported.authoritative

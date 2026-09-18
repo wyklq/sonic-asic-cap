@@ -2,6 +2,7 @@
 sai_cap_query
 *.o
 tests/test_cap_logic
+tests/test_json_value
 tests/test_integration
 tests/integration_sai_cap_query
 tests/integration_*.o

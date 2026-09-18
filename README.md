@@ -47,6 +47,9 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 
 # Falsify declared-gettable attribute claims with real GETs
 ./sai_cap_query --verify-attributes 0x21000000000000
+
+# Machine-readable output (stable schema, for diffs and CI golden files)
+./sai_cap_query --format json --all 0x21000000000000 > capabilities.json
 ```
 
 ### Exit codes
@@ -57,6 +60,31 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 | 1 | SAI initialization / query-setup failure |
 | 2 | bad command line |
 | 3 | switch VID did not validate (refused to run) |
+
+## Machine-readable output
+
+`--format json` emits a single JSON document on **stdout**; the human-readable
+banner and warnings move to **stderr**, so `> capabilities.json` captures only
+valid JSON. The document is byte-stable across runs on an unchanged system,
+which makes it usable for diffs and golden-file regression tests.
+
+Top-level keys (`schema_version` is currently `1`):
+
+| key | contents |
+|-----|----------|
+| `tool`, `schema_version`, `compiled_sai_version`, `linked_metadata_version` | provenance |
+| `switch_vid`, `transport`, `object_filter`, `all`, `include_unsupported`, `probe_stats`, `verify_attributes` | request echo |
+| `supported_object_types` | `authoritative` flag plus each advertised type, whether it is known to the local metadata, and whether it is experimental/vendor-custom |
+| `switch_attributes` | per-attribute `result` bucket (`ok` / `skipped_by_tool` / normalized failure) and value |
+| `attribute_capabilities` | per attribute: `asic_supported`, `create/set/get_implemented`, `conditional`, `valid_only`, `deprecated` |
+| `statistics_capabilities` | per object type: `counters` with `modes`, plus nested `stream_telemetry` with `minimal_polling_interval_ns` |
+| `resource_availability` | per object type: `status` and `available` |
+
+Unlike the text report, JSON mode does **not** truncate or cap anything:
+consumers are expected to filter, and silently dropping data would be worse
+than a large document. `--probe-stats` and `--verify-attributes` are
+line-oriented and are reported (on stderr) as excluded from JSON mode rather
+than being silently omitted.
 
 ## P1 coverage
 

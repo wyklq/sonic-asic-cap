@@ -95,6 +95,22 @@ main(int argc, char **argv)
         return output;
     };
 
+    /* Capture stdout only, so JSON purity can be asserted. */
+    auto run_stdout_only = [&](const std::string &args) {
+        const std::string command = tool + " " + args + " 2>/dev/null";
+        std::string output;
+        FILE *pipe = popen(command.c_str(), "r");
+        if (pipe == nullptr) {
+            return output;
+        }
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        pclose(pipe);
+        return output;
+    };
+
     /* 1. A bad VID must fail loudly and must NOT produce a capability report. */
     {
         const std::string out = run("--object PORT 0x99999999999999");
@@ -299,6 +315,53 @@ main(int argc, char **argv)
         expect_true(
             npu_contra > 0 && phy_contra == npu_contra + 2,
             "met conditions add exactly two contradictions");
+    }
+
+    /* 15. JSON mode must emit exactly one parseable document on stdout, with
+     *     the human-readable preamble moved to stderr. */
+    {
+        const std::string stdout_only = run_stdout_only(
+            "--format json 0x21000000000000");
+        const std::string merged = run(
+            "--format json 0x21000000000000");
+
+        expect_contains(stdout_only, "{\n  \"tool\": \"sai_cap_query\",",
+            "stdout starts with the JSON document");
+        expect_not_contains(stdout_only, "Switch VID validation: OK",
+            "validation banner is not on stdout in json mode");
+        expect_not_contains(stdout_only, "=== Version context ===",
+            "version banner is not on stdout in json mode");
+        expect_contains(stdout_only, "\"schema_version\": 1",
+            "schema version is present");
+        expect_contains(stdout_only, "\"supported_object_types\": {",
+            "supported object types are present");
+        expect_contains(merged, "Switch VID validation: OK",
+            "validation is still reported on stderr");
+    }
+
+    /* 16. JSON mode must reflect the same verdicts as the text path. */
+    {
+        const std::string out = run_stdout_only(
+            "--format json --all 0x21000000000000");
+        expect_contains(out, "\"asic_supported\": true",
+            "supported types are marked in json");
+        expect_contains(out, "\"create_implemented\": true",
+            "attribute capability fields are present");
+        expect_contains(out, "\"in_local_metadata\": true",
+            "object type provenance is present");
+        expect_contains(out, "\"counters\": [",
+            "stat counter lists are present");
+        expect_contains(out, "\"stream_telemetry\": {",
+            "stream telemetry is nested under stats");
+        expect_contains(out, "\"result\": \"ok\"",
+            "switch attribute outcomes are reported");
+    }
+
+    /* 17. A bad --format value must be rejected. */
+    {
+        const std::string out = run("--format xml 0x21000000000000");
+        expect_contains(out, "Invalid --format", "bad format is rejected");
+        expect_contains(out, "[exit=2]", "bad format exits 2");
     }
 
     std::printf("------------------------------------\n");
