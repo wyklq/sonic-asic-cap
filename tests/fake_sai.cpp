@@ -1,0 +1,324 @@
+/*
+ * fake_sai.cpp - an adversarial fake SAI adapter for the integration test.
+ *
+ * It replaces libsai / libsairedis so sai_cap_query can be exercised end to
+ * end without an ASIC. Behaviour is intentionally hostile:
+ *   - only one switch VID is valid; all others return INVALID_OBJECT_ID;
+ *   - the switch advertises only SWITCH and PORT as supported object types;
+ *   - some attributes succeed, some return plain NOT_SUPPORTED, and some
+ *     return vendor-style SAI_STATUS_ATTR_NOT_SUPPORTED_0|index range codes;
+ *   - list attributes force the caller through BUFFER_OVERFLOW growth.
+ */
+
+#include <cstring>
+#include <string>
+
+extern "C" {
+#include <sai.h>
+#include <saimetadatatypes.h>
+}
+
+namespace {
+
+constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;
+constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
+constexpr sai_object_id_t kQueueA = 0x15000000000001ULL;
+constexpr sai_object_id_t kIpgA = 0x1a000000000001ULL;
+
+sai_status_t
+fake_get_switch_attribute(
+    sai_object_id_t switch_id,
+    uint32_t attr_count,
+    sai_attribute_t *attr_list)
+{
+    if (switch_id != kGoodSwitch) {
+        return SAI_STATUS_INVALID_OBJECT_ID;
+    }
+    if (attr_list == nullptr || attr_count == 0) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    for (uint32_t i = 0; i < attr_count; ++i) {
+        sai_attribute_t &attr = attr_list[i];
+        switch (attr.id) {
+            case SAI_SWITCH_ATTR_TYPE:
+                attr.value.s32 = SAI_SWITCH_TYPE_NPU;
+                break;
+
+            case SAI_SWITCH_ATTR_PORT_LIST:
+                if (attr.value.objlist.count < 1) {
+                    attr.value.objlist.count = 1;
+                    return SAI_STATUS_BUFFER_OVERFLOW;
+                }
+                attr.value.objlist.count = 1;
+                attr.value.objlist.list[0] = kPortA;
+                break;
+
+            case SAI_SWITCH_ATTR_SUPPORTED_OBJECT_TYPE_LIST:
+                if (attr.value.s32list.count < 2) {
+                    attr.value.s32list.count = 2;
+                    return SAI_STATUS_BUFFER_OVERFLOW;
+                }
+                attr.value.s32list.count = 2;
+                attr.value.s32list.list[0] = SAI_OBJECT_TYPE_SWITCH;
+                attr.value.s32list.list[1] = SAI_OBJECT_TYPE_PORT;
+                break;
+
+            case SAI_SWITCH_ATTR_NUMBER_OF_ACTIVE_PORTS:
+                attr.value.u32 = 1;
+                break;
+
+            /* Vendor-style per-attribute range code. */
+            case SAI_SWITCH_ATTR_FDB_TABLE_SIZE:
+                return (sai_status_t)(
+                    static_cast<uint32_t>(SAI_STATUS_ATTR_NOT_SUPPORTED_0) |
+                    7u);
+
+            default:
+                return SAI_STATUS_NOT_SUPPORTED;
+        }
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+fake_set_switch_attribute(sai_object_id_t, const sai_attribute_t *)
+{
+    return SAI_STATUS_NOT_IMPLEMENTED;
+}
+
+sai_status_t
+fake_get_port_attribute(
+    sai_object_id_t port_id,
+    uint32_t attr_count,
+    sai_attribute_t *attr_list)
+{
+    if (port_id != kPortA) {
+        return SAI_STATUS_INVALID_OBJECT_ID;
+    }
+    if (attr_list == nullptr || attr_count == 0) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    for (uint32_t i = 0; i < attr_count; ++i) {
+        sai_attribute_t &attr = attr_list[i];
+        switch (attr.id) {
+            case SAI_PORT_ATTR_TYPE:
+                attr.value.s32 = SAI_PORT_TYPE_LOGICAL;
+                break;
+            case SAI_PORT_ATTR_QOS_QUEUE_LIST:
+                if (attr.value.objlist.count < 1) {
+                    attr.value.objlist.count = 1;
+                    return SAI_STATUS_BUFFER_OVERFLOW;
+                }
+                attr.value.objlist.count = 1;
+                attr.value.objlist.list[0] = kQueueA;
+                break;
+            case SAI_PORT_ATTR_INGRESS_PRIORITY_GROUP_LIST:
+                if (attr.value.objlist.count < 1) {
+                    attr.value.objlist.count = 1;
+                    return SAI_STATUS_BUFFER_OVERFLOW;
+                }
+                attr.value.objlist.count = 1;
+                attr.value.objlist.list[0] = kIpgA;
+                break;
+            default:
+                return SAI_STATUS_NOT_SUPPORTED;
+        }
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+fake_port_stats(
+    sai_object_id_t,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *,
+    uint64_t *counters)
+{
+    for (uint32_t i = 0; i < number_of_counters; ++i) {
+        counters[i] = 0;
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+fake_queue_stats(
+    sai_object_id_t,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *,
+    uint64_t *counters)
+{
+    for (uint32_t i = 0; i < number_of_counters; ++i) {
+        counters[i] = 0;
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+fake_ipg_stats(
+    sai_object_id_t,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *,
+    uint64_t *counters)
+{
+    for (uint32_t i = 0; i < number_of_counters; ++i) {
+        counters[i] = 0;
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_switch_api_t g_switch_api{};
+sai_port_api_t g_port_api{};
+sai_queue_api_t g_queue_api{};
+sai_buffer_api_t g_buffer_api{};
+
+} // namespace
+
+extern "C" {
+
+sai_status_t
+sai_api_initialize(uint64_t, const sai_service_method_table_t *)
+{
+    std::memset(&g_switch_api, 0, sizeof(g_switch_api));
+    std::memset(&g_port_api, 0, sizeof(g_port_api));
+    std::memset(&g_queue_api, 0, sizeof(g_queue_api));
+    std::memset(&g_buffer_api, 0, sizeof(g_buffer_api));
+
+    g_switch_api.get_switch_attribute = fake_get_switch_attribute;
+    g_switch_api.set_switch_attribute = fake_set_switch_attribute;
+    g_port_api.get_port_attribute = fake_get_port_attribute;
+    g_port_api.get_port_stats = fake_port_stats;
+    g_queue_api.get_queue_stats = fake_queue_stats;
+    g_buffer_api.get_ingress_priority_group_stats = fake_ipg_stats;
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_api_uninitialize(void)
+{
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_api_query(sai_api_t api, void **api_method_table)
+{
+    if (api_method_table == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    switch (api) {
+        case SAI_API_SWITCH:
+            *api_method_table = &g_switch_api;
+            return SAI_STATUS_SUCCESS;
+        case SAI_API_PORT:
+            *api_method_table = &g_port_api;
+            return SAI_STATUS_SUCCESS;
+        case SAI_API_QUEUE:
+            *api_method_table = &g_queue_api;
+            return SAI_STATUS_SUCCESS;
+        case SAI_API_BUFFER:
+            *api_method_table = &g_buffer_api;
+            return SAI_STATUS_SUCCESS;
+        default:
+            return SAI_STATUS_NOT_SUPPORTED;
+    }
+}
+
+sai_status_t
+sai_query_api_version(sai_api_version_t *version)
+{
+    if (version == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    *version = SAI_API_VERSION;
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_object_type_get_availability(
+    sai_object_id_t,
+    sai_object_type_t,
+    uint32_t,
+    const sai_attribute_t *,
+    uint64_t *count)
+{
+    if (count == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    *count = 16;
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_query_attribute_capability(
+    sai_object_id_t,
+    sai_object_type_t,
+    sai_attr_id_t,
+    sai_attr_capability_t *capability)
+{
+    if (capability == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    capability->create_implemented = true;
+    capability->set_implemented = true;
+    capability->get_implemented = true;
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_query_attribute_enum_values_capability(
+    sai_object_id_t,
+    sai_object_type_t,
+    sai_attr_id_t,
+    sai_s32_list_t *values)
+{
+    if (values == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    values->count = 0;
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_query_stats_capability(
+    sai_object_id_t,
+    sai_object_type_t,
+    sai_stat_capability_list_t *stats)
+{
+    if (stats == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    stats->count = 0;
+    return SAI_STATUS_SUCCESS;
+}
+
+} // extern "C"
+
+/* Display-only stand-ins for libsaimeta serializers. */
+std::string
+sai_serialize_status(sai_status_t status)
+{
+    switch (status) {
+        case SAI_STATUS_SUCCESS:
+            return "SAI_STATUS_SUCCESS";
+        case SAI_STATUS_NOT_SUPPORTED:
+            return "SAI_STATUS_NOT_SUPPORTED";
+        case SAI_STATUS_NOT_IMPLEMENTED:
+            return "SAI_STATUS_NOT_IMPLEMENTED";
+        case SAI_STATUS_BUFFER_OVERFLOW:
+            return "SAI_STATUS_BUFFER_OVERFLOW";
+        case SAI_STATUS_INVALID_OBJECT_ID:
+            return "SAI_STATUS_INVALID_OBJECT_ID";
+        default:
+            return "SAI_STATUS_OTHER";
+    }
+}
+
+std::string
+sai_serialize_attr_value(
+    const sai_attr_metadata_t &,
+    const sai_attribute_t &attribute,
+    bool)
+{
+    return std::string("<attr:") + std::to_string(attribute.id) + ">";
+}

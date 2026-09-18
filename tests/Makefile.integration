@@ -1,0 +1,47 @@
+# Integration tests for the P0 capability-hardening behaviour.
+#
+# Builds sai_cap_query against a fake SAI adapter (tests/test_integration.cpp)
+# plus the real SAI 1.17.5 generated metadata, so the tool's own logic is
+# exercised end to end without libsairedis, redis, or an ASIC.
+#
+# META_DIR points at a SAI checkout with generated metadata. Generate it with:
+#     cd <SAI>/meta && doxygen Doxyfile && ./attrversion.sh && perl -I. parse.pl -A
+# Defaults to ../../sai-meta-build/SAI/meta if that exists.
+
+CXX      ?= g++
+CC       ?= gcc
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
+CFLAGS   ?= -O2 -I../include/sai
+CPPFLAGS := -I../include -I../include/sai -I../include/meta -I../include/sairedis
+
+META_DIR ?= $(HOME)/sai-meta-build/SAI/meta
+
+TARGET := test_integration
+SRC    := test_integration.cpp
+FAKE   := fake_sai.cpp
+TOOL   := integration_sai_cap_query
+TOOL_SRC := ../sai_cap_query.cpp
+
+.PHONY: all integration clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ $(SRC)
+
+# Build the tool with the fake adapter. The fake supplies every SAI entry
+# point the tool calls; --unresolved-symbols=ignore-all would hide mistakes,
+# so instead the tool explicitly provides the two libsaimeta serializers it
+# needs (in fake_sai.cpp) and the metadata library is linked in full.
+$(TOOL): $(TOOL_SRC) $(FAKE) $(META_DIR)/saimetadata.c $(META_DIR)/saimetadatautils.c $(META_DIR)/saiserialize.c
+	$(CC) $(CFLAGS) -c $(META_DIR)/saimetadata.c -o integration_saimetadata.o
+	$(CC) $(CFLAGS) -c $(META_DIR)/saimetadatautils.c -o integration_saimetadatautils.o
+	$(CC) $(CFLAGS) -c $(META_DIR)/saiserialize.c -o integration_saiserialize.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -o $@ \
+		$(TOOL_SRC) $(FAKE) integration_saimetadata.o integration_saimetadatautils.o integration_saiserialize.o
+
+integration: $(TARGET) $(TOOL)
+	./$(TARGET) ./$(TOOL)
+
+clean:
+	rm -f $(TARGET) $(TOOL) integration_saimetadata.o integration_saimetadatautils.o integration_saiserialize.o
