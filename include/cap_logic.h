@@ -378,6 +378,78 @@ compare_attribute_capability_with_probe(
     return Agreement::Unverifiable;
 }
 
+/*
+ * Result of evaluating an attribute's condition on the sampled object.
+ *
+ * Unknown means the condition could not be evaluated (its referenced
+ * attributes could not be read, or use a value type the SAI metadata
+ * condition evaluator does not support).
+ */
+enum class ConditionState
+{
+    Unknown,
+    Met,
+    NotMet,
+};
+
+/*
+ * Value types the SAI metadata condition evaluator can compare. Conditions on
+ * anything else cannot be evaluated and must degrade to Unknown.
+ */
+inline bool
+is_condition_evaluable_value_type(sai_attr_value_type_t type)
+{
+    switch (type) {
+        case SAI_ATTR_VALUE_TYPE_BOOL:
+        case SAI_ATTR_VALUE_TYPE_INT8:
+        case SAI_ATTR_VALUE_TYPE_INT16:
+        case SAI_ATTR_VALUE_TYPE_INT32:
+        case SAI_ATTR_VALUE_TYPE_INT64:
+        case SAI_ATTR_VALUE_TYPE_UINT8:
+        case SAI_ATTR_VALUE_TYPE_UINT16:
+        case SAI_ATTR_VALUE_TYPE_UINT32:
+        case SAI_ATTR_VALUE_TYPE_UINT64:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/*
+ * Decide the verdict for an attribute whose condition state is known.
+ *
+ * A contradiction is only asserted when the tool has positively determined
+ * that the attribute is in force: either it is not conditional at all, or its
+ * condition evaluated to Met. An Unknown condition is treated conservatively
+ * as Unverifiable, because asserting a contradiction from an unevaluated
+ * condition would be a false positive.
+ */
+inline Agreement
+compare_attribute_capability_with_condition(
+    bool claimed_get,
+    bool probe_ok,
+    bool conditional,
+    ConditionState condition)
+{
+    if (!conditional) {
+        return compare_attribute_capability_with_probe(
+            claimed_get, probe_ok, false);
+    }
+
+    if (claimed_get == probe_ok) {
+        return Agreement::Agree;
+    }
+
+    if (claimed_get && !probe_ok) {
+        /* The attribute is expected to exist only when Met. */
+        return condition == ConditionState::Met
+            ? Agreement::Contradiction
+            : Agreement::Unverifiable;
+    }
+
+    return Agreement::Unverifiable;
+}
+
 inline std::string
 format_api_version(sai_api_version_t version)
 {

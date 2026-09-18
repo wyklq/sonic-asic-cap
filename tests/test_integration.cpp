@@ -53,6 +53,18 @@ expect_not_contains(
     }
 }
 
+void
+expect_true(bool value, const char *what)
+{
+    ++g_checks;
+    if (!value) {
+        ++g_failures;
+        std::printf("FAIL %-56s expected=true\n", what);
+    } else {
+        std::printf("ok   %-56s -> true\n", what);
+    }
+}
+
 } // namespace
 
 int
@@ -240,6 +252,53 @@ main(int argc, char **argv)
         expect_not_contains(
             out, "Live attribute capability verification",
             "attribute verification is opt-in");
+    }
+
+    /* 14. Conditional attributes must be evaluated, not blanket-exempted.
+     *     The fake's second switch reports SAI_SWITCH_TYPE_PHY, which makes
+     *     some switch attributes' conditions actually met; those must then be
+     *     verified (and reported as contradictions, since the fake does not
+     *     serve them) instead of being written off as unverifiable. */
+    {
+        const std::string npu = run("--verify-attributes 0x21000000000000");
+        const std::string phy = run("--verify-attributes 0x21000000000001");
+
+        expect_contains(
+            npu, "conditional attributes:",
+            "conditional attribute statistics are reported");
+        expect_contains(
+            npu, "condition_met=0",
+            "NPU switch has no met conditional attributes");
+        expect_contains(
+            phy, "condition_met=2",
+            "PHY switch evaluates two conditions as met");
+        expect_contains(
+            phy, "condition_unknown=24",
+            "unevaluated conditions are counted as unknown");
+        expect_contains(
+            phy,
+            "A contradiction is only asserted when the condition was "
+            "evaluated as met",
+            "the condition policy is stated in the report");
+
+        /*
+         * Met conditions must increase the contradiction count relative to
+         * the NPU switch, proving conditional attributes are no longer being
+         * skipped wholesale.
+         */
+        auto summary_value = [](const std::string &out) -> long {
+            const std::string key = "contradictions=";
+            const size_t at = out.find(key);
+            if (at == std::string::npos) {
+                return -1;
+            }
+            return std::strtol(out.c_str() + at + key.size(), nullptr, 10);
+        };
+        const long npu_contra = summary_value(npu);
+        const long phy_contra = summary_value(phy);
+        expect_true(
+            npu_contra > 0 && phy_contra == npu_contra + 2,
+            "met conditions add exactly two contradictions");
     }
 
     std::printf("------------------------------------\n");

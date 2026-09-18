@@ -491,6 +491,85 @@ test_attribute_capability_agreement()
         "non-gettable but readable is unverifiable");
 }
 
+/* ------------------------------------------------------------------ */
+/* condition-aware attribute verification                              */
+/* ------------------------------------------------------------------ */
+
+void
+test_condition_evaluability()
+{
+    expect_true(
+        cap::is_condition_evaluable_value_type(SAI_ATTR_VALUE_TYPE_BOOL),
+        "bool condition is evaluable");
+    expect_true(
+        cap::is_condition_evaluable_value_type(SAI_ATTR_VALUE_TYPE_INT32),
+        "int32 condition is evaluable");
+    expect_true(
+        cap::is_condition_evaluable_value_type(SAI_ATTR_VALUE_TYPE_UINT32),
+        "uint32 condition is evaluable");
+    /* Object ids and lists cannot be compared by the metadata evaluator. */
+    expect_false(
+        cap::is_condition_evaluable_value_type(SAI_ATTR_VALUE_TYPE_OBJECT_ID),
+        "object id condition is not evaluable");
+    expect_false(
+        cap::is_condition_evaluable_value_type(SAI_ATTR_VALUE_TYPE_OBJECT_LIST),
+        "object list condition is not evaluable");
+}
+
+void
+test_condition_aware_agreement()
+{
+    using cap::Agreement;
+    using cap::ConditionState;
+    using cap::compare_attribute_capability_with_condition;
+
+    /* Non-conditional attributes behave exactly as before. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            compare_attribute_capability_with_condition(
+                true, false, false, ConditionState::Met))),
+        "CONTRADICTION",
+        "non-conditional false claim is still a contradiction");
+
+    /*
+     * The payoff: a conditional attribute whose condition is positively
+     * evaluated as met is now a real contradiction, not merely unverifiable.
+     */
+    expect_eq(
+        std::string(cap::agreement_name(
+            compare_attribute_capability_with_condition(
+                true, false, true, ConditionState::Met))),
+        "CONTRADICTION",
+        "met condition turns a false claim into a contradiction");
+
+    /* Not met: the attribute is legitimately absent. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            compare_attribute_capability_with_condition(
+                true, false, true, ConditionState::NotMet))),
+        "UNVERIFIABLE",
+        "unmet condition is not a contradiction");
+
+    /*
+     * The false-positive guard: an unevaluated condition must never be
+     * promoted to a contradiction just because the GET failed.
+     */
+    expect_eq(
+        std::string(cap::agreement_name(
+            compare_attribute_capability_with_condition(
+                true, false, true, ConditionState::Unknown))),
+        "UNVERIFIABLE",
+        "unknown condition stays unverifiable");
+
+    /* Agreeing outcomes are unaffected by condition state. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            compare_attribute_capability_with_condition(
+                true, true, true, ConditionState::Unknown))),
+        "AGREE",
+        "successful GET agrees regardless of condition state");
+}
+
 } // namespace
 
 int
@@ -510,6 +589,8 @@ main()
     test_select_stats_mode();
     test_capability_agreement();
     test_attribute_capability_agreement();
+    test_condition_evaluability();
+    test_condition_aware_agreement();
 
     std::printf("--------------------\n");
     std::printf(

@@ -2205,12 +2205,112 @@ struct AttributeVerificationSummary
     size_t contradictions = 0;
     size_t unverifiable = 0;
     size_t skipped_value_type = 0;
+    size_t condition_met = 0;
+    size_t condition_not_met = 0;
+    size_t condition_unknown = 0;
     std::set<std::string> contradictory_attributes;
 };
 
 /* Defined after the probe helpers; used to pick a sample port. */
 sai_object_id_t
 select_sample_port(const std::vector<sai_object_id_t> &ports);
+
+/*
+ * Read the attributes a condition depends on, so the SAI metadata condition
+ * evaluator can be run against live values instead of defaults.
+ *
+ * Only attributes that can be read are passed through; if any referenced
+ * attribute cannot be read, the condition is reported as Unknown rather than
+ * being silently evaluated against its default (which could differ from the
+ * live value and yield a wrong verdict).
+ */
+ConditionState
+evaluate_attribute_condition(
+    const sai_attr_metadata_t *metadata,
+    const sai_object_type_info_t *info,
+    const AttributeGetter &getter)
+{
+    const bool is_conditional = metadata->isconditional;
+    const bool is_validonly = metadata->isvalidonly;
+
+    if (!is_conditional && !is_validonly) {
+        return ConditionState::Met;
+    }
+
+    const size_t count = is_conditional
+        ? metadata->conditionslength
+        : metadata->validonlylength;
+    const sai_attr_condition_t *const *list = is_conditional
+        ? metadata->conditions
+        : metadata->validonly;
+
+    if (count == 0 || list == nullptr) {
+        return ConditionState::Unknown;
+    }
+
+    std::vector<sai_attribute_t> attributes;
+    attributes.reserve(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        const sai_attr_condition_t *condition = list[i];
+        if (condition == nullptr) {
+            continue;
+        }
+
+        const sai_attr_metadata_t *referenced =
+            sai_metadata_get_attr_metadata(
+                info->objecttype, condition->attrid);
+        if (referenced == nullptr ||
+            !is_condition_evaluable_value_type(
+                referenced->attrvaluetype)) {
+            return ConditionState::Unknown;
+        }
+
+        /*
+         * Skip duplicates: sai_metadata_get_attr_by_id selects only the first
+         * matching entry, and passing the same id twice would be ambiguous.
+         */
+        bool already_read = false;
+        for (const auto &existing : attributes) {
+            if (existing.id == condition->attrid) {
+                already_read = true;
+                break;
+            }
+        }
+        if (already_read) {
+            continue;
+        }
+
+        sai_attribute_t attribute{};
+        attribute.id = condition->attrid;
+        AttributeStorage storage;
+        const FetchOutcome outcome =
+            fetch_attribute(referenced, getter, attribute, storage);
+        if (outcome.result != FetchKind::Ok) {
+            return ConditionState::Unknown;
+        }
+
+        /*
+         * The evaluable value types are all primitives held inline in the
+         * union, so copying the attribute (and letting the storage above go
+         * out of scope) cannot dangle. If conditions ever become evaluable on
+         * a pointer-backed type, this copy must be revisited.
+         */
+        attributes.push_back(attribute);
+    }
+
+    const bool met = is_conditional
+        ? sai_metadata_is_condition_met(
+              metadata,
+              static_cast<uint32_t>(attributes.size()),
+              attributes.empty() ? nullptr : attributes.data())
+        : sai_metadata_is_validonly_met(
+              metadata,
+              static_cast<uint32_t>(attributes.size()),
+              attributes.empty() ? nullptr : attributes.data());
+
+    return met ? ConditionState::Met : ConditionState::NotMet;
+}
 
 void
 verify_attribute_capabilities_on_object(
@@ -2266,13 +2366,32 @@ verify_attribute_capabilities_on_object(
             fetch_attribute(metadata, getter, attribute, storage);
 
         const bool probe_ok = outcome.result == FetchKind::Ok;
-        const bool conditionally_valid =
+        const bool conditional =
             metadata->isconditional || metadata->isvalidonly;
 
-        const Agreement agreement = compare_attribute_capability_with_probe(
-            capability.get_implemented,
-            probe_ok,
-            conditionally_valid);
+        ConditionState condition = ConditionState::Met;
+        if (conditional) {
+            condition = evaluate_attribute_condition(
+                metadata, info, getter);
+            switch (condition) {
+                case ConditionState::Met:
+                    ++summary.condition_met;
+                    break;
+                case ConditionState::NotMet:
+                    ++summary.condition_not_met;
+                    break;
+                case ConditionState::Unknown:
+                    ++summary.condition_unknown;
+                    break;
+            }
+        }
+
+        const Agreement agreement =
+            compare_attribute_capability_with_condition(
+                capability.get_implemented,
+                probe_ok,
+                conditional,
+                condition);
 
         switch (agreement) {
             case Agreement::Agree:
@@ -2395,6 +2514,19 @@ verify_attribute_capabilities(
         summary.contradictions,
         summary.unverifiable,
         summary.skipped_value_type);
+    if (summary.condition_met != 0 ||
+        summary.condition_not_met != 0 ||
+        summary.condition_unknown != 0) {
+        std::printf(
+            "  conditional attributes: condition_met=%zu "
+            "condition_not_met=%zu condition_unknown=%zu\n",
+            summary.condition_met,
+            summary.condition_not_met,
+            summary.condition_unknown);
+        std::printf(
+            "  A contradiction is only asserted when the condition was "
+            "evaluated as met; unknown conditions are unverifiable.\n");
+    }
 
     if (!summary.contradictory_attributes.empty()) {
         std::printf("  contradicted attributes (%zu):",

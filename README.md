@@ -27,7 +27,8 @@ make integration    # end-to-end tests against a fake SAI adapter
 ```
 
 `make integration` needs generated SAI metadata; point `META_DIR` at a SAI
-checkout containing `meta/saimetadata.c` (see `tests/Makefile.integration`).
+checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
+`meta/saiserialize.c` (see `tests/Makefile.integration`).
 
 ## Usage
 
@@ -81,12 +82,23 @@ P1 extends what the tool can actually observe and verify:
 * **Attribute capability verification** — `--verify-attributes` performs a
   real GET for every attribute the adapter declared `get_implemented`, on a
   live switch and port, and reports any claim it cannot substantiate as a
-  **CONTRADICTION**. Conditionally-valid attributes (`isconditional` /
-  `isvalidonly`) may legitimately reject a GET when their condition is unmet,
-  so those are reported as **UNVERIFIABLE**, never as contradictions. Output is
-  capped at 50 lines per object type while counts stay exact. Only SWITCH and
-  PORT can be sampled; other object types are reported as not verified rather
-  than silently assumed to be fine.
+  **CONTRADICTION**. Output is capped at 50 lines per object type while counts
+  stay exact. Only SWITCH and PORT can be sampled; other object types are
+  reported as not verified rather than silently assumed to be fine.
+* **Condition evaluation** — conditional and valid-only attributes are no
+  longer written off as unverifiable. The tool reads the attributes their
+  conditions depend on and evaluates them with the SAI metadata condition
+  evaluator (`sai_metadata_is_condition_met` / `sai_metadata_is_validonly_met`),
+  so an attribute whose condition is actually **met** becomes a real
+  contradiction when it fails to read. The result is deliberately
+  conservative:
+  - `condition_met` → a failed GET is a CONTRADICTION;
+  - `condition_not_met` → the attribute is legitimately absent, UNVERIFIABLE;
+  - `condition_unknown` (a referenced attribute could not be read, or uses a
+    value type the evaluator cannot compare) → UNVERIFIABLE.
+
+  An unevaluated condition is never promoted to a contradiction. The report
+  prints the met/not-met/unknown counts plus that policy.
 
 ### APIs that cannot be used over libsairedis
 

@@ -22,6 +22,12 @@ extern "C" {
 namespace {
 
 constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;
+/*
+ * Second valid switch that reports SAI_SWITCH_TYPE_PHY. Some switch
+ * attributes are conditional on TYPE == PHY, so this lets the integration
+ * test exercise the "condition evaluated as met" path.
+ */
+constexpr sai_object_id_t kPhySwitch = 0x21000000000001ULL;
 constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
 constexpr sai_object_id_t kQueueA = 0x15000000000001ULL;
 constexpr sai_object_id_t kIpgA = 0x1a000000000001ULL;
@@ -32,9 +38,10 @@ fake_get_switch_attribute(
     uint32_t attr_count,
     sai_attribute_t *attr_list)
 {
-    if (switch_id != kGoodSwitch) {
+    if (switch_id != kGoodSwitch && switch_id != kPhySwitch) {
         return SAI_STATUS_INVALID_OBJECT_ID;
     }
+    const bool phy = switch_id == kPhySwitch;
     if (attr_list == nullptr || attr_count == 0) {
         return SAI_STATUS_INVALID_PARAMETER;
     }
@@ -43,7 +50,8 @@ fake_get_switch_attribute(
         sai_attribute_t &attr = attr_list[i];
         switch (attr.id) {
             case SAI_SWITCH_ATTR_TYPE:
-                attr.value.s32 = SAI_SWITCH_TYPE_NPU;
+                attr.value.s32 =
+                    phy ? SAI_SWITCH_TYPE_PHY : SAI_SWITCH_TYPE_NPU;
                 break;
 
             case SAI_SWITCH_ATTR_PORT_LIST:
@@ -335,7 +343,7 @@ sai_query_attribute_capability(
      * anything else. Validating this in the fake catches callers that pass an
      * object id instead of the switch id.
      */
-    if (switch_id != kGoodSwitch) {
+    if (switch_id != kGoodSwitch && switch_id != kPhySwitch) {
         return SAI_STATUS_INVALID_OBJECT_ID;
     }
     if (capability == nullptr) {
