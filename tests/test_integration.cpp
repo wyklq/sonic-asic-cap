@@ -161,6 +161,58 @@ main(int argc, char **argv)
             "probe-stats reports accepted counters");
     }
 
+    /* 8. P1: the probe must falsify a declared-but-unreadable counter. */
+    {
+        const std::string out = run("--probe-stats 0x21000000000000");
+        expect_contains(
+            out, "CONTRADICTION: declared READ-capable but probe failed",
+            "probe cross-checks the declared stats capability");
+        expect_contains(
+            out, "SAI_PORT_STAT_IF_IN_ERRORS",
+            "the contradicted counter is named");
+        expect_contains(
+            out, "contradictions=1",
+            "exactly one contradiction is counted");
+    }
+
+    /* 9. P1: stream-telemetry capability section must be present and must
+     *    treat NOT_IMPLEMENTED as a normal answer. */
+    {
+        const std::string out = run("0x21000000000000");
+        expect_contains(
+            out, "=== Stream-telemetry statistics capabilities ===",
+            "stream-telemetry section is present");
+    }
+
+    /* 10. P1: discriminator-based availability must distinguish pools. */
+    {
+        const std::string out = run("0x21000000000000");
+        expect_contains(
+            out, "Resource availability by discriminator attribute",
+            "discriminator availability section is present");
+        expect_contains(
+            out, "discriminator=SAI_NEXT_HOP_ATTR_TYPE",
+            "a resource-type enum discriminator is probed");
+        expect_contains(
+            out, "Resource-type availability summary:",
+            "discriminator section reports a summary");
+    }
+
+    /* 11. P1: declared stat_modes must be validated with real reads, and
+     *     clear-capable modes must not run unless explicitly allowed. */
+    {
+        const std::string out = run("--probe-stats 0x21000000000000");
+        expect_contains(
+            out, "stat_modes validation",
+            "stat_modes validation runs");
+        expect_contains(
+            out, "modes summary:",
+            "stat_modes validation reports a summary");
+        expect_contains(
+            out, "pass --allow-clear",
+            "clear-capable modes are not probed unless allowed");
+    }
+
     std::printf("------------------------------------\n");
     std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

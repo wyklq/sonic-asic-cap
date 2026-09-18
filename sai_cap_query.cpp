@@ -102,6 +102,7 @@ struct Options
     bool show_help = false;
     bool list_switches = false;
     bool server_mode = false;
+    bool allow_clear = false;
     std::string object_filter;
     std::string client_config;
     std::string context_config;
@@ -146,6 +147,14 @@ using StatsGetter = std::function<sai_status_t(
     sai_object_id_t,
     uint32_t,
     const sai_stat_id_t *,
+    uint64_t *)>;
+
+/* Extended stats getter: takes an explicit sai_stats_mode_t. */
+using StatsExtGetter = std::function<sai_status_t(
+    sai_object_id_t,
+    uint32_t,
+    const sai_stat_id_t *,
+    sai_stats_mode_t,
     uint64_t *)>;
 
 /* ------------------------------------------------------------------ */
@@ -1404,10 +1413,143 @@ print_stats_capability(
     }
 }
 
+/*
+ * Stream-telemetry statistics capability.
+ *
+ * Unlike sai_query_stats_capability, this reports the minimal polling interval
+ * each counter can sustain. It is a newer API, so NOT_IMPLEMENTED /
+ * NOT_SUPPORTED is an expected and legitimate answer rather than an error.
+ */
+struct StatsStCapabilityResult
+{
+    sai_status_t status = SAI_STATUS_FAILURE;
+    std::vector<sai_stat_st_capability_t> values;
+    uint32_t required_count = 0;
+};
+
+StatsStCapabilityResult
+query_stats_st_capability(
+    sai_object_id_t switch_id,
+    const sai_object_type_info_t *info)
+{
+    StatsStCapabilityResult result;
+    uint32_t capacity = std::max<uint32_t>(
+        kInitialListCapacity,
+        static_cast<uint32_t>(
+            info->statenum == nullptr
+                ? kInitialListCapacity
+                : info->statenum->valuescount + 16));
+
+    for (unsigned int attempt = 0; attempt < 5; ++attempt) {
+        result.values.assign(capacity, {});
+
+        sai_stat_st_capability_list_t list{};
+        list.count = capacity;
+        list.list = result.values.data();
+
+        try {
+            result.status = sai_query_stats_st_capability(
+                switch_id,
+                info->objecttype,
+                &list);
+        } catch (const std::exception &) {
+            result.status = SAI_STATUS_FAILURE;
+        }
+        result.required_count = list.count;
+
+        if (result.status != SAI_STATUS_BUFFER_OVERFLOW) {
+            if (result.status == SAI_STATUS_SUCCESS) {
+                result.values.resize(
+                    std::min<uint32_t>(list.count, capacity));
+            } else {
+                result.values.clear();
+            }
+            return result;
+        }
+
+        if (list.count <= capacity) {
+            if (capacity > kMaximumListCapacity / 2) {
+                break;
+            }
+            capacity *= 2;
+        } else {
+            capacity = list.count;
+        }
+
+        if (capacity > kMaximumListCapacity) {
+            break;
+        }
+    }
+
+    result.values.clear();
+    return result;
+}
+
+void
+print_stats_st_capability(
+    const sai_object_type_info_t *info,
+    const StatsStCapabilityResult &result)
+{
+    std::printf(
+        "%s stream-telemetry stats: status=%s",
+        info->objecttypename,
+        format_status(result.status).c_str());
+
+    if (result.status == SAI_STATUS_SUCCESS) {
+        std::printf(" count=%zu\n", result.values.size());
+        for (const auto &value : result.values) {
+            std::printf(
+                "  %s modes=0x%x (%s) min_polling_ns=%" PRIu64 "\n",
+                format_enum_value(
+                    info->statenum,
+                    value.capability.stat_enum).c_str(),
+                value.capability.stat_modes,
+                format_stats_modes(
+                    value.capability.stat_modes).c_str(),
+                value.minimal_polling_interval);
+        }
+    } else if (result.status == SAI_STATUS_BUFFER_OVERFLOW) {
+        std::printf(" required_count=%u\n", result.required_count);
+    } else {
+        std::printf("\n");
+    }
+}
+
+/*
+ * Cached per-object-type statistics capability, used both for the report and
+ * to cross-check the live probe. Querying once avoids doubling the number of
+ * round trips during a scan.
+ */
+class StatsCapabilityCache
+{
+    public:
+        explicit StatsCapabilityCache(sai_object_id_t switch_id)
+            : m_switch_id(switch_id)
+        {
+        }
+
+        const StatsCapabilityResult &
+        get(const sai_object_type_info_t *info)
+        {
+            auto it = m_cache.find(info->objecttype);
+            if (it != m_cache.end()) {
+                return it->second;
+            }
+            auto inserted = m_cache.emplace(
+                info->objecttype,
+                query_stats_capability(m_switch_id, info));
+            return inserted.first->second;
+        }
+
+    private:
+        sai_object_id_t m_switch_id;
+        std::map<sai_object_type_t, StatsCapabilityResult> m_cache;
+};
+
 void
 show_stats_capabilities(
-    sai_object_id_t switch_id,
     const SupportedObjectTypes &supported,
+    StatsCapabilityCache &cache,
     bool all,
     const std::string &object_filter,
     bool include_unsupported)
@@ -1427,9 +1569,7 @@ show_stats_capabilities(
             const sai_object_type_info_t *info =
                 sai_metadata_get_object_type_info(type);
             if (info != nullptr && info->statenum != nullptr) {
-                print_stats_capability(
-                    info,
-                    query_stats_capability(switch_id, info));
+                print_stats_capability(info, cache.get(info));
             }
         }
         return;
@@ -1457,12 +1597,68 @@ show_stats_capabilities(
             continue;
         }
 
-        const StatsCapabilityResult result =
-            query_stats_capability(switch_id, info);
+        const StatsCapabilityResult &result = cache.get(info);
         if (result.status == SAI_STATUS_SUCCESS ||
             include_unsupported) {
             print_stats_capability(info, result);
         }
+    }
+}
+
+void
+show_stream_telemetry_capabilities(
+    sai_object_id_t switch_id,
+    const SupportedObjectTypes &supported,
+    bool all,
+    const std::string &object_filter,
+    bool include_unsupported)
+{
+    static const sai_object_type_t focused_types[] = {
+        SAI_OBJECT_TYPE_PORT,
+        SAI_OBJECT_TYPE_QUEUE,
+        SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP,
+        SAI_OBJECT_TYPE_SWITCH,
+    };
+
+    std::printf("\n=== Stream-telemetry statistics capabilities ===\n");
+    std::printf(
+        "min_polling_ns is the shortest interval the adapter accepts for that\n"
+        "counter. NOT_IMPLEMENTED/NOT_SUPPORTED here just means the adapter\n"
+        "does not expose the stream-telemetry query.\n");
+
+    auto one = [&](const sai_object_type_info_t *info) {
+        const StatsStCapabilityResult result =
+            query_stats_st_capability(switch_id, info);
+        if (result.status == SAI_STATUS_SUCCESS || include_unsupported) {
+            print_stats_st_capability(info, result);
+        }
+    };
+
+    if (!all && object_filter.empty()) {
+        for (sai_object_type_t type : focused_types) {
+            const sai_object_type_info_t *info =
+                sai_metadata_get_object_type_info(type);
+            if (info != nullptr && info->statenum != nullptr) {
+                one(info);
+            }
+        }
+        return;
+    }
+
+    for (size_t index = 1;
+         sai_metadata_all_object_type_infos[index] != nullptr;
+         ++index) {
+        const sai_object_type_info_t *info =
+            sai_metadata_all_object_type_infos[index];
+        if (info->statenum == nullptr ||
+            !matches_object_filter(info, object_filter)) {
+            continue;
+        }
+        if (supported.authoritative &&
+            !supported.is_supported(info->objecttype)) {
+            continue;
+        }
+        one(info);
     }
 }
 
@@ -1565,6 +1761,122 @@ show_generic_availability(
 }
 
 void
+show_resource_type_availability(
+    sai_object_id_t switch_id,
+    const SupportedObjectTypes &supported,
+    bool include_unsupported)
+{
+    std::printf("\n=== Resource availability by discriminator attribute ===\n");
+    std::printf(
+        "SAI object_type_get_availability accepts a resource-type attribute to\n"
+        "distinguish pools (for example ACL stage or next-hop type). This\n"
+        "section probes the declared resource-type ENUM attributes with their\n"
+        "documented values, which the plain attr_count=0 query cannot reach.\n");
+
+    size_t queried = 0;
+    size_t succeeded = 0;
+
+    for (size_t index = 1;
+         sai_metadata_all_object_type_infos[index] != nullptr;
+         ++index) {
+        const sai_object_type_info_t *info =
+            sai_metadata_all_object_type_infos[index];
+
+        if (supported.authoritative &&
+            !supported.is_supported(info->objecttype)) {
+            continue;
+        }
+
+        for (size_t attribute_index = 0;
+             info->attrmetadata[attribute_index] != nullptr;
+             ++attribute_index) {
+            const sai_attr_metadata_t *metadata =
+                info->attrmetadata[attribute_index];
+
+            /* Only enum attributes can be enumerated with known values. */
+            if (!metadata->isresourcetype ||
+                !metadata->isenum ||
+                metadata->enummetadata == nullptr) {
+                continue;
+            }
+
+            const sai_enum_metadata_t *enum_metadata =
+                metadata->enummetadata;
+
+            bool printed_header = false;
+            for (size_t value_index = 0;
+                 value_index < enum_metadata->valuescount;
+                 ++value_index) {
+                const int32_t enum_value =
+                    enum_metadata->values[value_index];
+
+                sai_attribute_t attribute{};
+                attribute.id = metadata->attrid;
+                attribute.value.s32 = enum_value;
+
+                uint64_t count = 0;
+                sai_status_t status = SAI_STATUS_FAILURE;
+                try {
+                    status = sai_object_type_get_availability(
+                        switch_id,
+                        info->objecttype,
+                        1,
+                        &attribute,
+                        &count);
+                } catch (const std::exception &) {
+                    status = SAI_STATUS_FAILURE;
+                }
+
+                ++queried;
+                if (status == SAI_STATUS_SUCCESS) {
+                    ++succeeded;
+                } else if (!include_unsupported) {
+                    continue;
+                }
+
+                if (!printed_header) {
+                    std::printf(
+                        "\n[%s] discriminator=%s\n",
+                        info->objecttypename,
+                        metadata->attridname);
+                    printed_header = true;
+                }
+
+                if (status == SAI_STATUS_SUCCESS) {
+                    std::printf(
+                        "  %-56s available=%" PRIu64 "\n",
+                        format_enum_value(
+                            enum_metadata,
+                            enum_value).c_str(),
+                        count);
+                } else {
+                    std::printf(
+                        "  %-56s status=%s\n",
+                        format_enum_value(
+                            enum_metadata,
+                            enum_value).c_str(),
+                        format_status(status).c_str());
+                }
+            }
+        }
+    }
+
+    std::printf(
+        "Resource-type availability summary: queried=%zu succeeded=%zu\n",
+        queried,
+        succeeded);
+    if (queried == 0) {
+        std::printf(
+            "No resource-type enum attributes found in metadata for the "
+            "queried object types; nothing to distinguish.\n");
+    } else if (succeeded == 0) {
+        std::printf(
+            "No discriminator query succeeded. This is common: many vendors "
+            "only implement attr_count=0 availability.\n");
+    }
+}
+
+void
 show_legacy_resource_attributes(
     sai_object_id_t switch_id,
     const sai_switch_api_t *switch_api,
@@ -1643,15 +1955,39 @@ get_object_list(
     return true;
 }
 
+/*
+ * Look up the declared capability for one stat id. Returns false when the
+ * adapter did not report any capability for that stat.
+ */
+bool
+find_declared_stat(
+    const StatsCapabilityResult &capability,
+    sai_stat_id_t stat,
+    uint32_t &modes)
+{
+    for (const auto &entry : capability.values) {
+        if (entry.stat_enum == stat) {
+            modes = entry.stat_modes;
+            return true;
+        }
+    }
+    return false;
+}
+
 void
 probe_stats_on_object(
     const sai_object_type_info_t *info,
     sai_object_id_t object_id,
+    const StatsCapabilityResult &capability,
     const StatsGetter &getter,
     bool include_failures)
 {
     std::map<std::string, size_t> failures;
     size_t success_count = 0;
+    size_t contradictions = 0;
+    size_t unclaimed = 0;
+    bool const capability_known =
+        capability.status == SAI_STATUS_SUCCESS;
 
     std::printf(
         "\n%s read probe on sample object 0x%" PRIx64
@@ -1678,17 +2014,46 @@ probe_stats_on_object(
             status = SAI_STATUS_FAILURE;
         }
 
-        if (status == SAI_STATUS_SUCCESS) {
+        const bool probe_ok = status == SAI_STATUS_SUCCESS;
+
+        /*
+         * Cross-check the declaration: a counter the adapter said supports
+         * READ must actually be readable. This is what turns the capability
+         * report from a claim into a verified statement.
+         */
+        uint32_t declared_modes = 0;
+        const bool claimed = capability_known
+            ? find_declared_stat(capability, stat, declared_modes)
+            : false;
+        const bool claimed_read = claimed
+            ? (declared_modes & SAI_STATS_MODE_READ) != 0
+            : claimed;
+
+        if (capability_known && !claimed) {
+            ++unclaimed;
+        }
+
+        if (probe_ok) {
             ++success_count;
             std::printf(
-                "  %-72s sample_value=%" PRIu64 "\n",
+                "  %-64s sample_value=%" PRIu64 "\n",
                 format_enum_value(info->statenum, raw).c_str(),
                 value);
+            continue;
+        }
+
+        if (capability_known && claimed_read) {
+            ++contradictions;
+            std::printf(
+                "  %-64s CONTRADICTION: declared READ-capable but probe "
+                "failed (%s)\n",
+                format_enum_value(info->statenum, raw).c_str(),
+                format_status(status).c_str());
         } else {
             ++failures[classify_status(status)];
             if (include_failures) {
                 std::printf(
-                    "  %-72s status=%s\n",
+                    "  %-64s status=%s\n",
                     format_enum_value(info->statenum, raw).c_str(),
                     format_status(status).c_str());
             }
@@ -1696,10 +2061,124 @@ probe_stats_on_object(
     }
 
     std::printf("  probe summary: accepted=%zu", success_count);
+    if (capability_known) {
+        std::printf(
+            " declared=%zu contradictions=%zu unclaimed=%zu",
+            capability.values.size(),
+            contradictions,
+            unclaimed);
+    } else {
+        std::printf(" capability=unavailable");
+    }
     for (const auto &entry : failures) {
         std::printf(" %s=%zu", entry.first.c_str(), entry.second);
     }
     std::printf("\n");
+}
+
+/*
+ * Validate the declared stat_modes bitmask against real reads.
+ *
+ * sai_query_stats_capability is a declaration; this asks the adapter to
+ * actually perform a read under each mode it claims, so BULK_READ /
+ * READ_AND_CLEAR support can be falsified instead of repeated.
+ *
+ * Only SAI_STATS_MODE_READ is exercised by default. READ_AND_CLEAR mutates
+ * counters, so it is only attempted when the caller passes --allow-clear.
+ */
+void
+validate_stats_modes_on_object(
+    const sai_object_type_info_t *info,
+    sai_object_id_t object_id,
+    const StatsCapabilityResult &capability,
+    const StatsExtGetter &ext_getter,
+    bool allow_clear)
+{
+    if (capability.status != SAI_STATUS_SUCCESS) {
+        std::printf(
+            "\n%s stat_modes validation skipped: capability unavailable\n",
+            info->objecttypename);
+        return;
+    }
+
+    std::printf(
+        "\n%s stat_modes validation on sample object 0x%" PRIx64
+        "%s:\n",
+        info->objecttypename,
+        static_cast<uint64_t>(object_id),
+        allow_clear ? " (clear allowed)" : " (read-only)");
+
+    size_t agree = 0;
+    size_t contradictions = 0;
+    size_t unverifiable = 0;
+    size_t no_mode = 0;
+
+    for (const auto &entry : capability.values) {
+        const sai_stat_id_t stat = entry.stat_enum;
+        const uint32_t modes = entry.stat_modes;
+
+        const char *stat_name =
+            sai_metadata_get_enum_value_name(info->statenum, stat);
+        if (is_stat_marker_name(stat_name)) {
+            continue;
+        }
+
+        const uint32_t mode =
+            select_read_only_stats_mode(modes, allow_clear);
+        if (mode == 0) {
+            ++no_mode;
+            continue;
+        }
+
+        uint64_t value = 0;
+        sai_status_t status = SAI_STATUS_FAILURE;
+        try {
+            status = ext_getter(
+                object_id,
+                1,
+                &stat,
+                static_cast<sai_stats_mode_t>(mode),
+                &value);
+        } catch (const std::exception &) {
+            status = SAI_STATUS_FAILURE;
+        }
+
+        const bool probe_ok = status == SAI_STATUS_SUCCESS;
+        const bool claimed = true; /* the adapter listed this stat */
+        const Agreement agreement =
+            compare_capability_with_probe(claimed, probe_ok);
+
+        switch (agreement) {
+            case Agreement::Agree:
+                ++agree;
+                break;
+            case Agreement::Contradiction:
+                ++contradictions;
+                std::printf(
+                    "  %-56s %s claimed 0x%x but ext read failed (%s)\n",
+                    format_enum_value(info->statenum, stat).c_str(),
+                    agreement_name(agreement),
+                    modes,
+                    format_status(status).c_str());
+                break;
+            case Agreement::Unverifiable:
+                ++unverifiable;
+                break;
+        }
+    }
+
+    std::printf(
+        "  modes summary: agree=%zu contradictions=%zu "
+        "unverifiable=%zu no_read_mode=%zu\n",
+        agree,
+        contradictions,
+        unverifiable,
+        no_mode);
+    if (!allow_clear) {
+        std::printf(
+            "  note: READ_AND_CLEAR/BULK_* modes were not exercised; "
+            "pass --allow-clear to test READ_AND_CLEAR (mutates counters).\n");
+    }
 }
 
 /*
@@ -1763,12 +2242,16 @@ void
 probe_live_stats(
     sai_object_id_t switch_id,
     const sai_switch_api_t *switch_api,
-    bool include_failures)
+    StatsCapabilityCache &cache,
+    bool include_failures,
+    bool allow_clear)
 {
     std::printf("\n=== Active read-only statistics probe ===\n");
     std::printf(
         "This probe never uses READ_AND_CLEAR, but it performs one SAI "
-        "read per metadata-known counter on one sample object per type.\n");
+        "read per metadata-known counter on one sample object per type.\n"
+        "Where the adapter declared READ support, a failed read is reported "
+        "as a CONTRADICTION.\n");
 
     std::vector<sai_object_id_t> ports;
     sai_status_t status = SAI_STATUS_FAILURE;
@@ -1814,6 +2297,7 @@ probe_live_stats(
         probe_stats_on_object(
             port_info,
             sample_port,
+            cache.get(port_info),
             [port_api](
                 sai_object_id_t object_id,
                 uint32_t count,
@@ -1823,6 +2307,23 @@ probe_live_stats(
                     object_id, count, ids, values);
             },
             include_failures);
+
+        if (port_api->get_port_stats_ext != nullptr) {
+            validate_stats_modes_on_object(
+                port_info,
+                sample_port,
+                cache.get(port_info),
+                [port_api](
+                    sai_object_id_t object_id,
+                    uint32_t count,
+                    const sai_stat_id_t *ids,
+                    sai_stats_mode_t mode,
+                    uint64_t *values) {
+                    return port_api->get_port_stats_ext(
+                        object_id, count, ids, mode, values);
+                },
+                allow_clear);
+        }
     }
 
     std::vector<sai_object_id_t> queues;
@@ -1849,6 +2350,7 @@ probe_live_stats(
                 probe_stats_on_object(
                     queue_info,
                     queues.front(),
+                    cache.get(queue_info),
                     [queue_api](
                         sai_object_id_t object_id,
                         uint32_t count,
@@ -1892,6 +2394,7 @@ probe_live_stats(
                 probe_stats_on_object(
                     ipg_info,
                     priority_groups.front(),
+                    cache.get(ipg_info),
                     [buffer_api](
                         sai_object_id_t object_id,
                         uint32_t count,
@@ -1910,6 +2413,27 @@ probe_live_stats(
             "0x%" PRIx64 ": %s\n",
             static_cast<uint64_t>(sample_port),
             format_status(status).c_str());
+    }
+
+    /* Switch-level counters, if the adapter exposes them. */
+    const sai_object_type_info_t *switch_info =
+        sai_metadata_get_object_type_info(SAI_OBJECT_TYPE_SWITCH);
+    if (switch_info != nullptr &&
+        switch_info->statenum != nullptr &&
+        switch_api->get_switch_stats != nullptr) {
+        probe_stats_on_object(
+            switch_info,
+            switch_id,
+            cache.get(switch_info),
+            [switch_api, switch_id](
+                sai_object_id_t object_id,
+                uint32_t count,
+                const sai_stat_id_t *ids,
+                uint64_t *values) {
+                return switch_api->get_switch_stats(
+                    object_id, count, ids, values);
+            },
+            include_failures);
     }
 }
 
@@ -2006,6 +2530,7 @@ print_usage(const char *program)
         "  --object <name>           Scan object types matching name (for example PORT)\n"
         "  --include-unsupported     Print every failed/unsupported query\n"
         "  --probe-stats             Read-test every known stat on sample live objects\n"
+        "  --allow-clear             Also probe READ_AND_CLEAR modes (mutates counters)\n"
         "  --list-switches           Validate and describe the supplied switch VID\n"
         "  --client                  Connect to running syncd (default)\n"
         "  --server                  Become a sairedis server (use only without syncd)\n"
@@ -2050,6 +2575,8 @@ parse_options(int argc, char **argv, Options &options)
             options.include_unsupported = true;
         } else if (argument == "--probe-stats") {
             options.probe_stats = true;
+        } else if (argument == "--allow-clear") {
+            options.allow_clear = true;
         } else if (argument == "--list-switches") {
             options.list_switches = true;
         } else if (argument == "--client") {
@@ -2381,7 +2908,20 @@ main(int argc, char **argv)
         show_focused_capabilities(requested_switch);
     }
 
+    /*
+     * Query statistics capability once per object type and share it between
+     * the report and the cross-validating live probe.
+     */
+    StatsCapabilityCache stats_cache(requested_switch);
+
     show_stats_capabilities(
+        supported,
+        stats_cache,
+        options.all,
+        options.object_filter,
+        options.include_unsupported);
+
+    show_stream_telemetry_capabilities(
         requested_switch,
         supported,
         options.all,
@@ -2395,6 +2935,11 @@ main(int argc, char **argv)
         options.object_filter,
         options.include_unsupported);
 
+    show_resource_type_availability(
+        requested_switch,
+        supported,
+        options.include_unsupported);
+
     show_legacy_resource_attributes(
         requested_switch,
         switch_api,
@@ -2404,7 +2949,9 @@ main(int argc, char **argv)
         probe_live_stats(
             requested_switch,
             switch_api,
-            options.include_unsupported);
+            stats_cache,
+            options.include_unsupported,
+            options.allow_clear);
     }
 
     status = sai_api_uninitialize();

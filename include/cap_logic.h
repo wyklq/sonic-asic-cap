@@ -291,6 +291,66 @@ format_stats_modes(uint32_t modes)
     return result;
 }
 
+/*
+ * Pick a concrete statistics mode for a probe, based on what the adapter
+ * declared and what the probe is allowed to use.
+ *
+ * READ is preferred because it is non-destructive. READ_AND_CLEAR is only
+ * chosen when explicitly allowed, because it mutates counters and affects
+ * production monitoring. Returns 0 when nothing suitable was declared.
+ */
+inline uint32_t
+select_read_only_stats_mode(uint32_t declared_modes, bool allow_clear)
+{
+    if ((declared_modes & SAI_STATS_MODE_READ) != 0) {
+        return SAI_STATS_MODE_READ;
+    }
+    if (allow_clear &&
+        (declared_modes & SAI_STATS_MODE_READ_AND_CLEAR) != 0) {
+        return SAI_STATS_MODE_READ_AND_CLEAR;
+    }
+    return 0;
+}
+
+/*
+ * Compare a reviewed capability record against the live probe outcome.
+ *
+ * This is how a vendor's claim is falsified: a stat the adapter said supports
+ * READ should actually be readable.
+ */
+enum class Agreement
+{
+    Agree,             /* claim and probe match */
+    Contradiction,     /* claim positive, probe negative */
+    Unverifiable,      /* no usable live object to probe */
+};
+
+inline Agreement
+compare_capability_with_probe(bool claimed_supported, bool probe_ok)
+{
+    if (claimed_supported == probe_ok) {
+        return Agreement::Agree;
+    }
+    if (claimed_supported && !probe_ok) {
+        return Agreement::Contradiction;
+    }
+    return Agreement::Unverifiable;
+}
+
+inline const char *
+agreement_name(Agreement agreement)
+{
+    switch (agreement) {
+        case Agreement::Agree:
+            return "AGREE";
+        case Agreement::Contradiction:
+            return "CONTRADICTION";
+        case Agreement::Unverifiable:
+            return "UNVERIFIABLE";
+    }
+    return "UNKNOWN";
+}
+
 inline std::string
 format_api_version(sai_api_version_t version)
 {

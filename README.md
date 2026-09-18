@@ -54,6 +54,38 @@ checkout containing `meta/saimetadata.c` (see `tests/Makefile.integration`).
 | 2 | bad command line |
 | 3 | switch VID did not validate (refused to run) |
 
+## P1 coverage
+
+P1 extends what the tool can actually observe and verify:
+
+* **Stream-telemetry statistics** — queries `sai_query_stats_st_capability`
+  and reports the minimal polling interval per counter. `NOT_IMPLEMENTED` is a
+  normal answer for adapters that do not expose this API.
+* **Discriminator-based availability** — `sai_object_type_get_availability` is
+  now also queried with resource-type attributes (for example
+  `SAI_NEXT_HOP_ATTR_TYPE`, `SAI_ACL_TABLE_ATTR_STAGE`), which the plain
+  `attr_count = 0` query cannot reach. Each documented enum value is probed.
+* **Counter cross-validation** — `--probe-stats` no longer just reads counters;
+  it compares each read against the `stat_modes` the adapter *declared*. A
+  counter declared `READ`-capable that fails to read is reported as a
+  **CONTRADICTION**, turning the capability report from a claim into a test.
+* **stat_modes validation** — port counters are re-read through
+  `get_port_stats_ext` under the declared mode, so an inflated `stat_modes`
+  bitmask is falsifiable. Only `READ` is exercised by default because the other
+  modes mutate counters; `--allow-clear` opts into `READ_AND_CLEAR`.
+* **Switch-level counters** — the live probe now also covers
+  `SAI_OBJECT_TYPE_SWITCH`, not just port/queue/IPG.
+
+### APIs that cannot be used over libsairedis
+
+`libsairedis`' `stub.pl` explicitly returns `NOT_IMPLEMENTED` for
+`sai_get_object_count`, `sai_get_object_key`,
+`sai_get_maximum_attribute_count`, `sai_bulk_get_attribute`,
+`sai_bulk_object_get_stats` and `sai_query_object_stage`, and `syncd`'s
+`VendorSai` registers the first three as `nullptr`. They are therefore **not**
+queried by this tool: calling them would report a transport limitation as if it
+were an ASIC capability.
+
 ## P0 hardening
 
 Earlier revisions could produce convincing but wrong reports. The current

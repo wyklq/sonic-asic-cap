@@ -58,6 +58,22 @@ expect_false(bool value, const char *what)
     }
 }
 
+void
+expect_eq_int(long actual, long expected, const char *what)
+{
+    ++g_checks;
+    if (actual != expected) {
+        ++g_failures;
+        std::printf(
+            "FAIL %-52s expected=%ld actual=%ld\n",
+            what,
+            expected,
+            actual);
+    } else {
+        std::printf("ok   %-52s -> %ld\n", what, actual);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* status normalization                                                */
 /* ------------------------------------------------------------------ */
@@ -348,6 +364,79 @@ test_summary_bucket()
         "skip and failure buckets differ");
 }
 
+/* ------------------------------------------------------------------ */
+/* stats mode selection                                                */
+/* ------------------------------------------------------------------ */
+
+void
+test_select_stats_mode()
+{
+    /* READ is always preferred: it does not mutate counters. */
+    expect_eq_int(
+        static_cast<long>(cap::select_read_only_stats_mode(
+            SAI_STATS_MODE_READ | SAI_STATS_MODE_READ_AND_CLEAR,
+            true)),
+        SAI_STATS_MODE_READ,
+        "READ preferred over READ_AND_CLEAR");
+
+    /* Without READ, READ_AND_CLEAR is only used when explicitly allowed. */
+    expect_eq_int(
+        static_cast<long>(cap::select_read_only_stats_mode(
+            SAI_STATS_MODE_READ_AND_CLEAR,
+            false)),
+        0,
+        "no mode selected when clear is disallowed");
+    expect_eq_int(
+        static_cast<long>(cap::select_read_only_stats_mode(
+            SAI_STATS_MODE_READ_AND_CLEAR,
+            true)),
+        SAI_STATS_MODE_READ_AND_CLEAR,
+        "read_and_clear selected only when allowed");
+
+    /* Bulk modes are never selected as a single-object read mode. */
+    expect_eq_int(
+        static_cast<long>(cap::select_read_only_stats_mode(
+            SAI_STATS_MODE_BULK_READ,
+            true)),
+        0,
+        "bulk_read is not a single-object read mode");
+    expect_eq_int(
+        static_cast<long>(cap::select_read_only_stats_mode(0, true)),
+        0,
+        "zero declared modes selects nothing");
+}
+
+/* ------------------------------------------------------------------ */
+/* claim vs probe agreement                                            */
+/* ------------------------------------------------------------------ */
+
+void
+test_capability_agreement()
+{
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_capability_with_probe(true, true))),
+        "AGREE",
+        "claimed and readable agree");
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_capability_with_probe(false, false))),
+        "AGREE",
+        "not claimed and not readable agree");
+    /* The only case that falsifies a vendor claim. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_capability_with_probe(true, false))),
+        "CONTRADICTION",
+        "claimed but unreadable is a contradiction");
+    /* Claimed unsupported but actually works is not a lie about support. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_capability_with_probe(false, true))),
+        "UNVERIFIABLE",
+        "unclaimed but readable is unverifiable");
+}
+
 } // namespace
 
 int
@@ -364,6 +453,8 @@ main()
     test_stat_markers();
     test_value_type_predicates();
     test_summary_bucket();
+    test_select_stats_mode();
+    test_capability_agreement();
 
     std::printf("--------------------\n");
     std::printf(

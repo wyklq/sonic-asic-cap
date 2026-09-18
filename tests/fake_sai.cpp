@@ -16,12 +16,12 @@
 extern "C" {
 #include <sai.h>
 #include <saimetadatatypes.h>
+#include <saimetadatautils.h>
 }
 
 namespace {
 
-constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;
-constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
+constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
 constexpr sai_object_id_t kQueueA = 0x15000000000001ULL;
 constexpr sai_object_id_t kIpgA = 0x1a000000000001ULL;
 
@@ -55,13 +55,18 @@ fake_get_switch_attribute(
                 break;
 
             case SAI_SWITCH_ATTR_SUPPORTED_OBJECT_TYPE_LIST:
-                if (attr.value.s32list.count < 2) {
-                    attr.value.s32list.count = 2;
+                /*
+                 * Includes NEXT_HOP so the resource-type discriminator path
+                 * (NEXT_HOP_ATTR_TYPE is a resource-type enum) is exercised.
+                 */
+                if (attr.value.s32list.count < 3) {
+                    attr.value.s32list.count = 3;
                     return SAI_STATUS_BUFFER_OVERFLOW;
                 }
-                attr.value.s32list.count = 2;
+                attr.value.s32list.count = 3;
                 attr.value.s32list.list[0] = SAI_OBJECT_TYPE_SWITCH;
                 attr.value.s32list.list[1] = SAI_OBJECT_TYPE_PORT;
+                attr.value.s32list.list[2] = SAI_OBJECT_TYPE_NEXT_HOP;
                 break;
 
             case SAI_SWITCH_ATTR_NUMBER_OF_ACTIVE_PORTS:
@@ -77,6 +82,46 @@ fake_get_switch_attribute(
             default:
                 return SAI_STATUS_NOT_SUPPORTED;
         }
+    }
+    return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+fake_port_stats(
+    sai_object_id_t object_id,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *counter_ids,
+    uint64_t *counters);
+
+sai_status_t
+fake_port_stats_ext(
+    sai_object_id_t object_id,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *counter_ids,
+    sai_stats_mode_t mode,
+    uint64_t *counters)
+{
+    /*
+     * Adversarial: BULK_READ is declared nowhere, but if asked, return
+     * NOT_SUPPORTED so a false claim would be caught. READ behaves like
+     * fake_port_stats.
+     */
+    if (mode != SAI_STATS_MODE_READ) {
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+    return fake_port_stats(
+        object_id, number_of_counters, counter_ids, counters);
+}
+
+sai_status_t
+fake_switch_stats(
+    sai_object_id_t,
+    uint32_t number_of_counters,
+    const sai_stat_id_t *,
+    uint64_t *counters)
+{
+    for (uint32_t i = 0; i < number_of_counters; ++i) {
+        counters[i] = 0;
     }
     return SAI_STATUS_SUCCESS;
 }
@@ -133,10 +178,18 @@ sai_status_t
 fake_port_stats(
     sai_object_id_t,
     uint32_t number_of_counters,
-    const sai_stat_id_t *,
+    const sai_stat_id_t *counter_ids,
     uint64_t *counters)
 {
+    /*
+     * Deliberately fail one specific counter the capability query declares as
+     * READ-capable, so the probe must report a CONTRADICTION. Any other
+     * counter succeeds.
+     */
     for (uint32_t i = 0; i < number_of_counters; ++i) {
+        if (counter_ids[i] == SAI_PORT_STAT_IF_IN_ERRORS) {
+            return SAI_STATUS_NOT_SUPPORTED;
+        }
         counters[i] = 0;
     }
     return SAI_STATUS_SUCCESS;
@@ -187,8 +240,10 @@ sai_api_initialize(uint64_t, const sai_service_method_table_t *)
 
     g_switch_api.get_switch_attribute = fake_get_switch_attribute;
     g_switch_api.set_switch_attribute = fake_set_switch_attribute;
+    g_switch_api.get_switch_stats = fake_switch_stats;
     g_port_api.get_port_attribute = fake_get_port_attribute;
     g_port_api.get_port_stats = fake_port_stats;
+    g_port_api.get_port_stats_ext = fake_port_stats_ext;
     g_queue_api.get_queue_stats = fake_queue_stats;
     g_buffer_api.get_ingress_priority_group_stats = fake_ipg_stats;
     return SAI_STATUS_SUCCESS;
@@ -238,15 +293,33 @@ sai_status_t
 sai_object_type_get_availability(
     sai_object_id_t,
     sai_object_type_t,
-    uint32_t,
-    const sai_attribute_t *,
+    uint32_t attr_count,
+    const sai_attribute_t *attr_list,
     uint64_t *count)
 {
     if (count == nullptr) {
         return SAI_STATUS_INVALID_PARAMETER;
     }
-    *count = 16;
-    return SAI_STATUS_SUCCESS;
+
+    /*
+     * Adversarial behaviour: the plain attr_count=0 query works, but a
+     * discriminator query only works for the first enum value. This lets the
+     * integration test tell the two paths apart.
+     */
+    if (attr_count == 0) {
+        *count = 16;
+        return SAI_STATUS_SUCCESS;
+    }
+
+    if (attr_list == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+
+    if (attr_list[0].value.s32 == 0) {
+        *count = 8;
+        return SAI_STATUS_SUCCESS;
+    }
+    return SAI_STATUS_NOT_SUPPORTED;
 }
 
 sai_status_t
@@ -282,14 +355,51 @@ sai_query_attribute_enum_values_capability(
 sai_status_t
 sai_query_stats_capability(
     sai_object_id_t,
-    sai_object_type_t,
+    sai_object_type_t object_type,
     sai_stat_capability_list_t *stats)
 {
     if (stats == nullptr) {
         return SAI_STATUS_INVALID_PARAMETER;
     }
-    stats->count = 0;
+
+    /*
+     * The fake declares every known stat of the object type as READ-capable.
+     * Because fake_port_stats deliberately fails on one specific counter, the
+     * tool must report exactly one CONTRADICTION for PORT. That is the
+     * cross-validation behaviour this test exists to protect.
+     */
+    const sai_object_type_info_t *info =
+        sai_metadata_get_object_type_info(object_type);
+    if (info == nullptr || info->statenum == nullptr) {
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+
+    const uint32_t needed =
+        static_cast<uint32_t>(info->statenum->valuescount);
+    if (stats->count < needed) {
+        stats->count = needed;
+        return SAI_STATUS_BUFFER_OVERFLOW;
+    }
+
+    stats->count = needed;
+    for (uint32_t i = 0; i < needed; ++i) {
+        stats->list[i].stat_enum = info->statenum->values[i];
+        stats->list[i].stat_modes = SAI_STATS_MODE_READ;
+    }
     return SAI_STATUS_SUCCESS;
+}
+
+sai_status_t
+sai_query_stats_st_capability(
+    sai_object_id_t,
+    sai_object_type_t,
+    sai_stat_st_capability_list_t *stats)
+{
+    /* The fake adapter does not implement stream telemetry. */
+    if (stats == nullptr) {
+        return SAI_STATUS_INVALID_PARAMETER;
+    }
+    return SAI_STATUS_NOT_IMPLEMENTED;
 }
 
 } // extern "C"
