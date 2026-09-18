@@ -41,8 +41,11 @@ checkout containing `meta/saimetadata.c` (see `tests/Makefile.integration`).
 # Full scan, all metadata-known objects and attributes
 ./sai_cap_query --all 0x21000000000000
 
-# Read-probe every known counter on a sample port/queue/IPG
+# Read-probe every known counter on a sample port/queue/IPG/switch
 ./sai_cap_query --probe-stats 0x21000000000000
+
+# Falsify declared-gettable attribute claims with real GETs
+./sai_cap_query --verify-attributes 0x21000000000000
 ```
 
 ### Exit codes
@@ -75,6 +78,15 @@ P1 extends what the tool can actually observe and verify:
   modes mutate counters; `--allow-clear` opts into `READ_AND_CLEAR`.
 * **Switch-level counters** — the live probe now also covers
   `SAI_OBJECT_TYPE_SWITCH`, not just port/queue/IPG.
+* **Attribute capability verification** — `--verify-attributes` performs a
+  real GET for every attribute the adapter declared `get_implemented`, on a
+  live switch and port, and reports any claim it cannot substantiate as a
+  **CONTRADICTION**. Conditionally-valid attributes (`isconditional` /
+  `isvalidonly`) may legitimately reject a GET when their condition is unmet,
+  so those are reported as **UNVERIFIABLE**, never as contradictions. Output is
+  capped at 50 lines per object type while counts stay exact. Only SWITCH and
+  PORT can be sampled; other object types are reported as not verified rather
+  than silently assumed to be fine.
 
 ### APIs that cannot be used over libsairedis
 

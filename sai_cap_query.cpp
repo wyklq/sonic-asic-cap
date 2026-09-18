@@ -82,6 +82,8 @@ is_stat_marker_name(const char *name)
 }
 
 constexpr uint32_t kInitialListCapacity = 64;
+/* Cap how many contradiction lines are printed; counts stay exact. */
+constexpr size_t kMaxContradictionLines = 50;
 constexpr uint32_t kMaximumListCapacity = 1024 * 1024;
 
 /* ------------------------------------------------------------------ */
@@ -103,6 +105,7 @@ struct Options
     bool list_switches = false;
     bool server_mode = false;
     bool allow_clear = false;
+    bool verify_attributes = false;
     std::string object_filter;
     std::string client_config;
     std::string context_config;
@@ -2182,6 +2185,238 @@ validate_stats_modes_on_object(
 }
 
 /*
+ * Live verification of attribute capability claims.
+ *
+ * sai_query_attribute_capability is a declaration. For attributes the adapter
+ * says are gettable, this performs a real GET on a live object and reports any
+ * claim it cannot substantiate as a CONTRADICTION.
+ *
+ * Conditionally-valid attributes (isconditional / isvalidonly) can legitimately
+ * fail a GET when their condition is not met on the sampled object, so those
+ * are reported as UNVERIFIABLE rather than as contradictions.
+ *
+ * Only object types for which the tool can obtain a live object are checked;
+ * everything else is reported as not-verifiable instead of silently skipped.
+ */
+struct AttributeVerificationSummary
+{
+    size_t checked = 0;
+    size_t agree = 0;
+    size_t contradictions = 0;
+    size_t unverifiable = 0;
+    size_t skipped_value_type = 0;
+    std::set<std::string> contradictory_attributes;
+};
+
+/* Defined after the probe helpers; used to pick a sample port. */
+sai_object_id_t
+select_sample_port(const std::vector<sai_object_id_t> &ports);
+
+void
+verify_attribute_capabilities_on_object(
+    const sai_object_type_info_t *info,
+    sai_object_id_t switch_id,
+    sai_object_id_t object_id,
+    const AttributeGetter &getter,
+    bool include_unsupported,
+    AttributeVerificationSummary &summary)
+{
+    std::printf(
+        "\n%s live attribute verification on object 0x%" PRIx64 ":\n",
+        info->objecttypename,
+        static_cast<uint64_t>(object_id));
+
+    size_t object_checked = 0;
+    size_t printed_contradictions = 0;
+    size_t hidden_contradictions = 0;
+
+    for (size_t index = 0;
+         info->attrmetadata[index] != nullptr;
+         ++index) {
+        const sai_attr_metadata_t *metadata = info->attrmetadata[index];
+
+        if (!can_fetch_value_type(metadata->attrvaluetype)) {
+            ++summary.skipped_value_type;
+            continue;
+        }
+
+        sai_attr_capability_t capability{};
+        sai_status_t capability_status = SAI_STATUS_FAILURE;
+        try {
+            capability_status = sai_query_attribute_capability(
+                switch_id,
+                info->objecttype,
+                metadata->attrid,
+                &capability);
+        } catch (const std::exception &) {
+            capability_status = SAI_STATUS_FAILURE;
+        }
+
+        if (capability_status != SAI_STATUS_SUCCESS ||
+            !capability.get_implemented) {
+            continue;
+        }
+
+        ++object_checked;
+        ++summary.checked;
+
+        sai_attribute_t attribute{};
+        AttributeStorage storage;
+        const FetchOutcome outcome =
+            fetch_attribute(metadata, getter, attribute, storage);
+
+        const bool probe_ok = outcome.result == FetchKind::Ok;
+        const bool conditionally_valid =
+            metadata->isconditional || metadata->isvalidonly;
+
+        const Agreement agreement = compare_attribute_capability_with_probe(
+            capability.get_implemented,
+            probe_ok,
+            conditionally_valid);
+
+        switch (agreement) {
+            case Agreement::Agree:
+                ++summary.agree;
+                break;
+            case Agreement::Contradiction:
+                ++summary.contradictions;
+                summary.contradictory_attributes.insert(
+                    metadata->attridname);
+                if (printed_contradictions < kMaxContradictionLines) {
+                    ++printed_contradictions;
+                    std::printf(
+                        "  %-64s CONTRADICTION: declared gettable but GET "
+                        "failed (%s)\n",
+                        metadata->attridname,
+                        format_status(outcome.status).c_str());
+                } else {
+                    ++hidden_contradictions;
+                }
+                break;
+            case Agreement::Unverifiable:
+                ++summary.unverifiable;
+                if (include_unsupported) {
+                    std::printf(
+                        "  %-64s unverifiable (conditional, GET said %s)\n",
+                        metadata->attridname,
+                        format_status(outcome.status).c_str());
+                }
+                break;
+        }
+    }
+
+    std::printf(
+        "  %s live verification: checked=%zu\n",
+        info->objecttypename,
+        object_checked);
+    if (hidden_contradictions != 0) {
+        std::printf(
+            "  ... %zu more contradiction(s) not printed; use the summary "
+            "and the contradicted-attributes list below.\n",
+            hidden_contradictions);
+    }
+}
+
+/*
+ * Attribute claims can only be verified on object types for which a live
+ * object exists. SWITCH and PORT are always obtainable; that is stated
+ * explicitly so an unverified attribute is never read as a verified one.
+ */
+void
+verify_attribute_capabilities(
+    sai_object_id_t switch_id,
+    const sai_switch_api_t *switch_api,
+    bool include_unsupported)
+{
+    std::printf("\n=== Live attribute capability verification ===\n");
+    std::printf(
+        "Performs a real GET for every attribute the adapter declared gettable\n"
+        "on a live object. Conditionally-valid attributes that reject a GET are\n"
+        "reported as unverifiable, not as contradictions. Only SWITCH and PORT\n"
+        "are verified; other object types cannot be sampled by this tool.\n");
+
+    AttributeVerificationSummary summary;
+
+    const sai_object_type_info_t *switch_info =
+        sai_metadata_get_object_type_info(SAI_OBJECT_TYPE_SWITCH);
+    if (switch_info != nullptr) {
+        verify_attribute_capabilities_on_object(
+            switch_info,
+            switch_id,
+            switch_id,
+            [switch_api, switch_id](sai_attribute_t *value) {
+                return switch_api->get_switch_attribute(
+                    switch_id, 1, value);
+            },
+            include_unsupported,
+            summary);
+    }
+
+    std::vector<sai_object_id_t> ports;
+    sai_status_t status = SAI_STATUS_FAILURE;
+    if (get_object_list(
+            find_attribute("SAI_SWITCH_ATTR_PORT_LIST"),
+            [switch_api, switch_id](sai_attribute_t *value) {
+                return switch_api->get_switch_attribute(
+                    switch_id, 1, value);
+            },
+            ports,
+            status) &&
+        !ports.empty()) {
+        const sai_object_type_info_t *port_info =
+            sai_metadata_get_object_type_info(SAI_OBJECT_TYPE_PORT);
+        void *api_table = nullptr;
+        if (port_info != nullptr &&
+            sai_api_query(SAI_API_PORT, &api_table) == SAI_STATUS_SUCCESS &&
+            api_table != nullptr) {
+            const auto *port_api =
+                static_cast<const sai_port_api_t *>(api_table);
+            const sai_object_id_t sample_port = select_sample_port(ports);
+            if (sample_port != SAI_NULL_OBJECT_ID) {
+                verify_attribute_capabilities_on_object(
+                    port_info,
+                    switch_id,
+                    sample_port,
+                    [port_api, sample_port](sai_attribute_t *value) {
+                        return port_api->get_port_attribute(
+                            sample_port, 1, value);
+                    },
+                    include_unsupported,
+                    summary);
+            }
+        }
+    }
+
+    std::printf(
+        "\nAttribute verification summary: checked=%zu agree=%zu "
+        "contradictions=%zu unverifiable=%zu skipped_value_type=%zu\n",
+        summary.checked,
+        summary.agree,
+        summary.contradictions,
+        summary.unverifiable,
+        summary.skipped_value_type);
+
+    if (!summary.contradictory_attributes.empty()) {
+        std::printf("  contradicted attributes (%zu):",
+            summary.contradictory_attributes.size());
+        size_t printed = 0;
+        for (const auto &name : summary.contradictory_attributes) {
+            if (printed++ >= kMaxContradictionLines) {
+                std::printf(" ...");
+                break;
+            }
+            std::printf(" %s", name.c_str());
+        }
+        std::printf("\n");
+    }
+    if (summary.checked == 0) {
+        std::printf(
+            "No gettable attribute claims were verifiable on the sampled "
+            "objects.\n");
+    }
+}
+
+/*
  * Pick a usable front-panel port instead of blindly taking ports.front(),
  * which on SONiC is often a CPU or management port whose queue list is empty.
  */
@@ -2531,6 +2766,7 @@ print_usage(const char *program)
         "  --include-unsupported     Print every failed/unsupported query\n"
         "  --probe-stats             Read-test every known stat on sample live objects\n"
         "  --allow-clear             Also probe READ_AND_CLEAR modes (mutates counters)\n"
+        "  --verify-attributes       Real GET for every declared-gettable attribute\n"
         "  --list-switches           Validate and describe the supplied switch VID\n"
         "  --client                  Connect to running syncd (default)\n"
         "  --server                  Become a sairedis server (use only without syncd)\n"
@@ -2577,6 +2813,8 @@ parse_options(int argc, char **argv, Options &options)
             options.probe_stats = true;
         } else if (argument == "--allow-clear") {
             options.allow_clear = true;
+        } else if (argument == "--verify-attributes") {
+            options.verify_attributes = true;
         } else if (argument == "--list-switches") {
             options.list_switches = true;
         } else if (argument == "--client") {
@@ -2952,6 +3190,13 @@ main(int argc, char **argv)
             stats_cache,
             options.include_unsupported,
             options.allow_clear);
+    }
+
+    if (options.verify_attributes) {
+        verify_attribute_capabilities(
+            requested_switch,
+            switch_api,
+            options.include_unsupported);
     }
 
     status = sai_api_uninitialize();

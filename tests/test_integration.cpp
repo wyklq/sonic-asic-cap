@@ -213,6 +213,35 @@ main(int argc, char **argv)
             "clear-capable modes are not probed unless allowed");
     }
 
+    /* 12. Next step: attribute capability claims are verified with real GETs. */
+    {
+        const std::string out = run("--verify-attributes 0x21000000000000");
+        expect_contains(
+            out, "=== Live attribute capability verification ===",
+            "attribute verification section is present");
+        expect_contains(
+            out, "declared gettable but GET failed",
+            "a false gettable claim is reported");
+        expect_contains(
+            out, "Attribute verification summary:",
+            "attribute verification reports a summary");
+        expect_contains(
+            out, "contradicted attributes (",
+            "contradicted attributes are listed");
+        expect_contains(
+            out, "more contradiction(s) not printed",
+            "contradiction output is bounded");
+    }
+
+    /* 13. Attribute verification must be off by default (it costs a GET per
+     *     attribute). */
+    {
+        const std::string out = run("0x21000000000000");
+        expect_not_contains(
+            out, "Live attribute capability verification",
+            "attribute verification is opt-in");
+    }
+
     std::printf("------------------------------------\n");
     std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

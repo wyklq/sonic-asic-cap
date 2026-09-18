@@ -21,7 +21,8 @@ extern "C" {
 
 namespace {
 
-constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
+constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;
+constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
 constexpr sai_object_id_t kQueueA = 0x15000000000001ULL;
 constexpr sai_object_id_t kIpgA = 0x1a000000000001ULL;
 
@@ -324,11 +325,19 @@ sai_object_type_get_availability(
 
 sai_status_t
 sai_query_attribute_capability(
-    sai_object_id_t,
+    sai_object_id_t switch_id,
     sai_object_type_t,
     sai_attr_id_t,
     sai_attr_capability_t *capability)
 {
+    /*
+     * Mirror libsairedis, which requires a valid SWITCH oid here and rejects
+     * anything else. Validating this in the fake catches callers that pass an
+     * object id instead of the switch id.
+     */
+    if (switch_id != kGoodSwitch) {
+        return SAI_STATUS_INVALID_OBJECT_ID;
+    }
     if (capability == nullptr) {
         return SAI_STATUS_INVALID_PARAMETER;
     }

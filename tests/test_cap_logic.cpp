@@ -437,6 +437,60 @@ test_capability_agreement()
         "unclaimed but readable is unverifiable");
 }
 
+/* ------------------------------------------------------------------ */
+/* attribute claim vs live GET                                         */
+/* ------------------------------------------------------------------ */
+
+void
+test_attribute_capability_agreement()
+{
+    /* Claimed gettable and the GET worked. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_attribute_capability_with_probe(
+                true, true, false))),
+        "AGREE",
+        "gettable claim confirmed by GET");
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_attribute_capability_with_probe(
+                false, false, false))),
+        "AGREE",
+        "non-gettable claim matches failed GET");
+
+    /* Claimed gettable but the GET failed on an unconditional attribute. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_attribute_capability_with_probe(
+                true, false, false))),
+        "CONTRADICTION",
+        "gettable claim falsified by GET");
+
+    /*
+     * The critical false-positive guard: a conditionally-valid attribute may
+     * legitimately reject a GET when its condition is unmet, so it must not be
+     * reported as a contradiction.
+     */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_attribute_capability_with_probe(
+                true, false, true))),
+        "UNVERIFIABLE",
+        "conditional attribute failure is not a contradiction");
+    expect_true(
+        cap::compare_attribute_capability_with_probe(true, false, true) !=
+            cap::compare_attribute_capability_with_probe(true, false, false),
+        "conditional and unconditional failures differ");
+
+    /* Claimed non-gettable but GET worked: not a false claim of support. */
+    expect_eq(
+        std::string(cap::agreement_name(
+            cap::compare_attribute_capability_with_probe(
+                false, true, false))),
+        "UNVERIFIABLE",
+        "non-gettable but readable is unverifiable");
+}
+
 } // namespace
 
 int
@@ -455,6 +509,7 @@ main()
     test_summary_bucket();
     test_select_stats_mode();
     test_capability_agreement();
+    test_attribute_capability_agreement();
 
     std::printf("--------------------\n");
     std::printf(

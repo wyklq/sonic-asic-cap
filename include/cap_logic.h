@@ -351,6 +351,33 @@ agreement_name(Agreement agreement)
     return "UNKNOWN";
 }
 
+/*
+ * Compare an attribute capability claim against a real GET on a live object.
+ *
+ * Attributes that only exist under a condition (isconditional / isvalidonly)
+ * may legitimately reject a GET when the condition is not met on this object,
+ * so a failed probe there is Unverifiable, not a Contradiction. Without this
+ * distinction the tool would emit false contradictions for conditional
+ * attributes, which is exactly the kind of false positive it exists to avoid.
+ */
+inline Agreement
+compare_attribute_capability_with_probe(
+    bool claimed_get,
+    bool probe_ok,
+    bool conditionally_valid)
+{
+    if (claimed_get == probe_ok) {
+        return Agreement::Agree;
+    }
+    if (claimed_get && !probe_ok) {
+        return conditionally_valid
+            ? Agreement::Unverifiable
+            : Agreement::Contradiction;
+    }
+    /* Claimed not-gettable but the GET actually worked: not a false claim. */
+    return Agreement::Unverifiable;
+}
+
 inline std::string
 format_api_version(sai_api_version_t version)
 {
