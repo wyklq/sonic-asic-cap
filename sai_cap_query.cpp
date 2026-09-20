@@ -2262,9 +2262,86 @@ sai_object_id_t
 select_sample_port(const std::vector<sai_object_id_t> &ports);
 
 /*
+ * Per-object cache of the attributes referenced by condition predicates.
+ *
+ * Condition lists on one object tend to reference the same handful of
+ * attributes (a queue count gating dozens of per-queue attributes, for
+ * example), and each conditional attribute used to re-read every attribute
+ * its conditions depend on. Caching by attribute id cuts the GET round
+ * trips on one object scan from O(conditional attributes x referenced) to
+ * O(distinct referenced).
+ *
+ * Failures are cached too: a predicate whose referenced attribute could
+ * not be read stays Unknown without repeating the failing GET for every
+ * consumer.
+ *
+ * Only condition-evaluable types reach this cache, and those are all
+ * primitives held inline in the attribute union, so a cached value stays
+ * valid once the fetch-time buffer goes out of scope. If conditions ever
+ * become evaluable on a pointer-backed type, this class must change.
+ */
+class ConditionAttributeCache
+{
+public:
+    explicit ConditionAttributeCache(const AttributeGetter &getter)
+        : m_getter(getter) {}
+
+    /*
+     * Return the cached value of one referenced attribute, fetching it on
+     * first use. The result is SAI_STATUS_SUCCESS only when the read
+     * succeeded; any other status (including a cached earlier failure)
+     * means the caller must treat the predicate as Unknown, exactly as a
+     * direct fetch failure did.
+     */
+    sai_status_t read(
+        const sai_attr_metadata_t *referenced,
+        sai_attribute_t &attribute)
+    {
+        attribute = {};
+        attribute.id = referenced->attrid;
+
+        Entry &entry = m_entries[referenced->attrid];
+
+        if (!entry.attempted) {
+            entry.attempted = true;
+
+            sai_attribute_t fetched{};
+            AttributeStorage storage;
+            const FetchOutcome outcome = fetch_attribute(
+                referenced, m_getter, fetched, storage);
+
+            entry.status = outcome.status;
+            entry.ok = outcome.result == FetchKind::Ok;
+            if (entry.ok) {
+                entry.value = fetched;
+            }
+        }
+
+        attribute = entry.value;
+        return entry.ok ? SAI_STATUS_SUCCESS : entry.status;
+    }
+
+private:
+    struct Entry
+    {
+        bool attempted = false;
+        bool ok = false;
+        sai_status_t status = SAI_STATUS_FAILURE;
+        sai_attribute_t value{};
+    };
+
+    std::map<sai_attr_id_t, Entry> m_entries;
+    const AttributeGetter &m_getter;
+};
+
+/*
  * Read the attributes one condition predicate depends on, so the SAI
  * metadata condition evaluator can be run against live values instead of
  * defaults.
+ *
+ * Reads go through the per-object ConditionAttributeCache, because the
+ * same few attributes tend to gate many conditional attributes on one
+ * object and re-reading them per consumer multiplies the GET round trips.
  *
  * Only attributes that can be read are passed through; if any referenced
  * attribute cannot be read, the predicate is reported as Unknown rather than
@@ -2282,7 +2359,7 @@ ConditionState
 evaluate_condition_list(
     const sai_attr_metadata_t *metadata,
     const sai_object_type_info_t *info,
-    const AttributeGetter &getter,
+    ConditionAttributeCache &cache,
     const sai_attr_condition_t *const *list,
     size_t count,
     bool conditional_predicate)
@@ -2326,19 +2403,16 @@ evaluate_condition_list(
         }
 
         sai_attribute_t attribute{};
-        attribute.id = condition->attrid;
-        AttributeStorage storage;
-        const FetchOutcome outcome =
-            fetch_attribute(referenced, getter, attribute, storage);
-        if (outcome.result != FetchKind::Ok) {
+        if (cache.read(referenced, attribute) != SAI_STATUS_SUCCESS) {
             return ConditionState::Unknown;
         }
 
         /*
-         * The evaluable value types are all primitives held inline in the
-         * union, so copying the attribute (and letting the storage above go
-         * out of scope) cannot dangle. If conditions ever become evaluable on
-         * a pointer-backed type, this copy must be revisited.
+         * The cached attribute is a copy of a condition-evaluable value,
+         * which is always a primitive held inline in the union, so the
+         * copy stays valid independently of the cache. If conditions ever
+         * become evaluable on a pointer-backed type, ConditionAttributeCache
+         * and this copy must both be revisited.
          */
         attributes.push_back(attribute);
         ++usable;
@@ -2378,12 +2452,15 @@ evaluate_condition_list(
  *
  * Every flag the attribute carries is evaluated, and the results are combined
  * by combine_condition_states, which yields Met only when all of them are Met.
+ *
+ * The cache shared with the enclosing object scan keeps attributes that
+ * both predicates reference down to a single GET per object.
  */
 ConditionState
 evaluate_attribute_condition(
     const sai_attr_metadata_t *metadata,
     const sai_object_type_info_t *info,
-    const AttributeGetter &getter)
+    ConditionAttributeCache &cache)
 {
     ConditionState state = ConditionState::Met;
 
@@ -2391,7 +2468,7 @@ evaluate_attribute_condition(
         state = evaluate_condition_list(
             metadata,
             info,
-            getter,
+            cache,
             metadata->conditions,
             metadata->conditionslength,
             true);
@@ -2401,7 +2478,7 @@ evaluate_attribute_condition(
         const ConditionState validonly = evaluate_condition_list(
             metadata,
             info,
-            getter,
+            cache,
             metadata->validonly,
             metadata->validonlylength,
             false);
@@ -2428,6 +2505,13 @@ verify_attribute_capabilities_on_object(
     size_t object_checked = 0;
     size_t printed_contradictions = 0;
     size_t hidden_contradictions = 0;
+
+    /*
+     * One cache per object scan: attributes referenced by condition lists
+     * are read once here and shared by every conditional attribute on this
+     * object, instead of being re-fetched per consumer.
+     */
+    ConditionAttributeCache cache(getter);
 
     for (size_t index = 0;
          info->attrmetadata[index] != nullptr;
@@ -2471,7 +2555,7 @@ verify_attribute_capabilities_on_object(
         ConditionState condition = ConditionState::Met;
         if (conditional) {
             condition = evaluate_attribute_condition(
-                metadata, info, getter);
+                metadata, info, cache);
             switch (condition) {
                 case ConditionState::Met:
                     ++summary.condition_met;
