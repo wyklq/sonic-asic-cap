@@ -736,7 +736,10 @@ main(int argc, char **argv)
                         "server preflight failure runs no queries");
                 }
                 close(holder);
-                unlink("/tmp/saiServer");
+                if (bound) {
+                    /* Only remove the socket this test created itself. */
+                    unlink("/tmp/saiServer");
+                }
 
                 const std::string suppressed =
                     run("--server 0x21000000000000");
