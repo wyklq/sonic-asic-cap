@@ -50,6 +50,10 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 
 # Machine-readable output (stable schema, for diffs and CI golden files)
 ./sai_cap_query --format json --all 0x21000000000000 > capabilities.json
+
+# Diagnose the transport when queries fail (see Transport model below)
+./sai_cap_query --debug 0x21000000000000
+SAI_CAP_ENABLE_CLIENT=unset ./sai_cap_query --debug 0x21000000000000
 ```
 
 ### Exit codes
@@ -60,6 +64,44 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 | 1 | SAI initialization / query-setup failure |
 | 2 | bad command line |
 | 3 | switch VID did not validate (refused to run) |
+
+## Transport model (client vs server)
+
+`libsairedis` serves two roles, selected by the `SAI_REDIS_ENABLE_CLIENT`
+profile answer:
+
+| role | profile answer | how operations are served |
+|------|----------------|---------------------------|
+| client | `SAI_REDIS_ENABLE_CLIENT=true` | requests go over the ZMQ channels (client_config.json or built-in defaults) to the sairedis server embedded in `syncd`; **requires syncd running with `-z`** (ZMQ synchronous mode) |
+| server | anything else / key absent | libsairedis's default role: operations are served through the Redis channel; this is the role dozens of SONiC diagnostics used for years, and it works against a normally running (async mode) syncd |
+
+The tool answers `true` by default (`--client`, the default) and `false` with
+`--server`. If an environment only serves one of the two paths, every call on
+the other path fails: a client against an async syncd fails with
+`SAI_STATUS_FAILURE` on the first real operation (and
+`sai_query_api_version` answers `SAI_STATUS_NOT_IMPLEMENTED`, a client-side
+stub), while a server-role lookup of a switch object absent from the ASIC view
+fails with `SAI_STATUS_ITEM_NOT_FOUND`.
+
+Builds before `--client` support existed answered **nothing** for
+`SAI_REDIS_ENABLE_CLIENT`, so libsairedis always applied its own default (the
+server role above). A box that only serves the Redis channel therefore worked
+with those builds and refuses to report with the client default.
+
+### Debugging the transport
+
+* `--debug` prints, to stderr, the resolved transport, every
+  `SAI_REDIS_KEY_*` answer the profile gives libsairedis, and wall-clock
+  timings around `sai_api_initialize`, `sai_query_api_version` and the switch
+  VID validation GET. An instant failure points at the transport, a long wait
+  points at a response that never arrived.
+* `SAI_CAP_ENABLE_CLIENT=true|false|unset` overrides the `ENABLE_CLIENT`
+  answer for one run; `unset` (also `none`/`absent`) answers `nullptr`,
+  reproducing the pre-`--client` builds exactly. This is the bisect knob for
+  "which role does this box actually serve".
+* Exit code 3 (the switch VID did not validate) now prints the on-switch
+  triage commands: whether the object is in the ASIC view, whether syncd
+  serves ZMQ, and whether the client endpoints exist.
 
 ## Machine-readable output
 

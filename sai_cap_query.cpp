@@ -55,6 +55,7 @@ std::string sai_serialize_status(sai_status_t status);
 #include <array>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
@@ -124,6 +125,7 @@ struct Options
     bool server_mode = false;
     bool allow_clear = false;
     bool verify_attributes = false;
+    bool debug = false;
     std::string format = "text";
     std::string object_filter;
     std::string client_config;
@@ -3508,6 +3510,88 @@ profile_state()
     return &state;
 }
 
+/*
+ * Single source of truth for every SAI_REDIS_KEY_* answer this process
+ * gives libsairedis. Both the profile callback libsairedis sees and the
+ * --debug dump go through here, so what gets printed is exactly what the
+ * library received.
+ *
+ * The answers select the transport libsairedis uses:
+ *   SAI_REDIS_KEY_ENABLE_CLIENT = "true" makes this process a sairedis
+ *     CLIENT that talks to the server embedded in syncd over the ZMQ
+ *     channels (from client_config.json or the built-in defaults);
+ *   anything else (including nullptr) leaves libsairedis in its default
+ *     server role, where operations are served through the Redis channel.
+ * An environment that only serves one of these paths fails every call on
+ * the other, so a wrong answer here breaks the entire report.
+ *
+ * SAI_CAP_ENABLE_CLIENT overrides the ENABLE_CLIENT answer for diagnosis:
+ *   "true" / "false"              answer that string (force one path);
+ *   "unset" / "none" / "absent"   answer nullptr, i.e. no override at all,
+ *                                 exactly like the builds that predate
+ *                                 client-mode support, so libsairedis
+ *                                 applies its own default; this also tests
+ *                                 whether the library treats a missing key
+ *                                 differently from an explicit "false".
+ * Any other value is ignored and the transport-derived default applies.
+ */
+const char *
+redis_profile_answer(const ProfileState &state, const char *variable)
+{
+    if (variable == nullptr) {
+        return nullptr;
+    }
+
+    const std::string key(variable);
+
+    if (key == SAI_REDIS_KEY_ENABLE_CLIENT) {
+        static const char *const override_env =
+            std::getenv("SAI_CAP_ENABLE_CLIENT");
+
+        if (override_env != nullptr) {
+            if (std::strcmp(override_env, "true") == 0) {
+                return "true";
+            }
+            if (std::strcmp(override_env, "false") == 0) {
+                return "false";
+            }
+            if (std::strcmp(override_env, "unset") == 0 ||
+                std::strcmp(override_env, "none") == 0 ||
+                std::strcmp(override_env, "absent") == 0) {
+                return nullptr;
+            }
+        }
+
+        /*
+         * Default to CLIENT: acting as a server lets this tool bind the
+         * endpoint syncd already owns and shares the synchronous response
+         * queue with any other client, which is only acceptable when no
+         * syncd is running.
+         */
+        return state.transport == Transport::Client ? "true" : "false";
+    }
+
+    if (key == SAI_REDIS_KEY_CLIENT_CONFIG) {
+        return state.options.client_config.empty()
+            ? nullptr
+            : state.options.client_config.c_str();
+    }
+
+    if (key == SAI_REDIS_KEY_CONTEXT_CONFIG) {
+        return state.options.context_config.empty()
+            ? nullptr
+            : state.options.context_config.c_str();
+    }
+
+    if (key == SAI_REDIS_KEY_SERVER_CONFIG) {
+        return state.options.server_config.empty()
+            ? nullptr
+            : state.options.server_config.c_str();
+    }
+
+    return nullptr;
+}
+
 const char *
 profile_get_value(
     sai_switch_profile_id_t profile_id,
@@ -3515,41 +3599,7 @@ profile_get_value(
 {
     (void)profile_id;
 
-    if (variable == nullptr) {
-        return nullptr;
-    }
-
-    ProfileState *state = profile_state();
-    const std::string key(variable);
-
-    if (key == SAI_REDIS_KEY_ENABLE_CLIENT) {
-        /*
-         * Default to CLIENT. Acting as a server makes this tool bind the
-         * endpoint syncd already owns and corrupts the shared response queue;
-         * that is only acceptable when no syncd is running.
-         */
-        return state->transport == Transport::Client ? "true" : "false";
-    }
-
-    if (key == SAI_REDIS_KEY_CLIENT_CONFIG) {
-        return state->options.client_config.empty()
-            ? nullptr
-            : state->options.client_config.c_str();
-    }
-
-    if (key == SAI_REDIS_KEY_CONTEXT_CONFIG) {
-        return state->options.context_config.empty()
-            ? nullptr
-            : state->options.context_config.c_str();
-    }
-
-    if (key == SAI_REDIS_KEY_SERVER_CONFIG) {
-        return state->options.server_config.empty()
-            ? nullptr
-            : state->options.server_config.c_str();
-    }
-
-    return nullptr;
+    return redis_profile_answer(*profile_state(), variable);
 }
 
 int
@@ -3593,6 +3643,7 @@ print_usage(const char *program)
         "  --context-config <file>   sairedis context_config.json\n"
         "  --server-config <file>    sairedis server_config.json\n"
         "  --timeout-ms <n>          Synchronous response timeout in milliseconds\n"
+        "  --debug                   Print transport/profile diagnostics to stderr\n"
         "  -h, --help                Show this help\n"
         "\n"
         "Examples:\n"
@@ -3634,6 +3685,8 @@ parse_options(int argc, char **argv, Options &options)
             options.allow_clear = true;
         } else if (argument == "--verify-attributes") {
             options.verify_attributes = true;
+        } else if (argument == "--debug") {
+            options.debug = true;
         } else if (argument == "--format") {
             if (!need_value(index, "--format", options.format)) {
                 return false;
@@ -3749,6 +3802,44 @@ parse_switch_vid(const char *text, sai_object_id_t &switch_id)
     return true;
 }
 
+/*
+ * Wall-clock timer for --debug, scoped around one libsairedis call. The
+ * destructor prints the elapsed time even when the scope is left through
+ * an early return or an exception, which is exactly the case where the
+ * timing matters most: an instant SAI_STATUS_FAILURE means the transport
+ * was refused or the library refused locally, while a long wait means the
+ * request went out and the response never arrived.
+ */
+class DebugTimer
+{
+public:
+    DebugTimer(const char *label, bool enabled)
+        : m_label(label),
+          m_enabled(enabled),
+          m_start(std::chrono::steady_clock::now()) {}
+
+    ~DebugTimer()
+    {
+        if (!m_enabled) {
+            return;
+        }
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - m_start)
+                .count();
+        std::fprintf(
+            stderr,
+            "debug: %s took %lld ms\n",
+            m_label,
+            static_cast<long long>(elapsed));
+    }
+
+private:
+    const char *m_label;
+    bool m_enabled;
+    std::chrono::steady_clock::time_point m_start;
+};
+
 } // namespace
 
 /* ------------------------------------------------------------------ */
@@ -3788,12 +3879,43 @@ main(int argc, char **argv)
      * bad VID must never be reported as "the ASIC does not support this".
      */
 
+    if (options.debug) {
+        /*
+         * Everything here goes to stderr unconditionally: in JSON mode
+         * stdout must carry exactly one document, and in text mode the
+         * diagnostics stay separable from the report.
+         */
+        std::fprintf(
+            stderr,
+            "debug: transport=%s%s\n",
+            state->transport == Transport::Client ? "client" : "server",
+            state->transport == Transport::Client
+                ? " (SAI_REDIS_ENABLE_CLIENT=true)"
+                : " (SAI_REDIS_ENABLE_CLIENT=false)");
+        std::fprintf(stderr, "debug: profile answers to libsairedis:\n");
+        static const char *const keys[] = {
+            SAI_REDIS_KEY_ENABLE_CLIENT,
+            SAI_REDIS_KEY_CLIENT_CONFIG,
+            SAI_REDIS_KEY_CONTEXT_CONFIG,
+            SAI_REDIS_KEY_SERVER_CONFIG,
+        };
+        for (const char *key : keys) {
+            const char *answer = redis_profile_answer(*state, key);
+            std::fprintf(
+                stderr,
+                "debug:   %s = %s\n",
+                key,
+                answer == nullptr ? "(nullptr)" : answer);
+        }
+    }
+
     sai_service_method_table_t services{};
     services.profile_get_value = profile_get_value;
     services.profile_get_next_value = profile_get_next_value;
 
     sai_status_t status = SAI_STATUS_FAILURE;
     try {
+        DebugTimer timer("sai_api_initialize", options.debug);
         status = sai_api_initialize(0, &services);
     } catch (const std::exception &exception) {
         std::fprintf(
@@ -3856,6 +3978,7 @@ main(int argc, char **argv)
 
     sai_api_version_t queried_version = 0;
     try {
+        DebugTimer timer("sai_query_api_version", options.debug);
         status = sai_query_api_version(&queried_version);
     } catch (const std::exception &) {
         status = SAI_STATUS_FAILURE;
@@ -3912,6 +4035,7 @@ main(int argc, char **argv)
         attribute.id = type_metadata->attrid;
         status = SAI_STATUS_FAILURE;
         try {
+            DebugTimer timer("switch VID validation GET", options.debug);
             status = switch_api->get_switch_attribute(
                 requested_switch, 1, &attribute);
         } catch (const std::exception &exception) {
@@ -3924,16 +4048,41 @@ main(int argc, char **argv)
         }
 
         if (status != SAI_STATUS_SUCCESS) {
+            char oid_text[32];
+            std::snprintf(
+                oid_text,
+                sizeof(oid_text),
+                "0x%" PRIx64,
+                static_cast<uint64_t>(requested_switch));
             std::fprintf(
                 stderr,
-                "\nFATAL: switch VID 0x%" PRIx64 " is not a valid live "
+                "\nFATAL: switch VID %s is not a valid live "
                 "switch: %s\n"
                 "Refusing to run capability queries, because every answer "
                 "would be a false negative.\n"
                 "Check the VID against ASIC_DB / syncd, and make sure the "
                 "context config matches.\n",
-                static_cast<uint64_t>(requested_switch),
+                oid_text,
                 format_status(status).c_str());
+            std::fprintf(
+                stderr,
+                "Triage on the switch:\n"
+                "  object in the ASIC view? redis-cli -n 0 HGETALL "
+                "ASIC_STATE_TABLE | grep %s\n"
+                "  syncd serving ZMQ?      ps -o args= -C syncd   (look for "
+                "-z; without it a sairedis CLIENT cannot work, use --server "
+                "or SAI_CAP_ENABLE_CLIENT=false)\n"
+                "  client endpoints?       ls -l /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
+                oid_text);
+            if (options.debug) {
+                std::fprintf(
+                    stderr,
+                    "debug: transport at failure=%s; rerun with "
+                    "SAI_CAP_ENABLE_CLIENT=false|true|unset to bisect the "
+                    "transport\n",
+                    state->transport == Transport::Client ? "client"
+                                                          : "server");
+            }
             sai_api_uninitialize();
             return 3;
         }

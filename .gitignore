@@ -15,3 +15,4 @@ lib/*.so.*
 *.swp
 *~
 .DS_Store
+.workbuddy

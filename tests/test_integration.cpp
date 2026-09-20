@@ -111,6 +111,22 @@ main(int argc, char **argv)
         return output;
     };
 
+    /* Run with one environment variable prefixed to the command. */
+    auto run_env = [&](const std::string &env, const std::string &args) {
+        const std::string command = env + " " + tool + " " + args + " 2>&1";
+        std::string output;
+        FILE *pipe = popen(command.c_str(), "r");
+        if (pipe == nullptr) {
+            return output;
+        }
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        pclose(pipe);
+        return output;
+    };
+
     /*
      * Extract one top-level member of the pretty-printed JSON document so a
      * section can be examined without a full parser. A top-level member's
@@ -500,6 +516,86 @@ main(int argc, char **argv)
         expect_not_contains(
             stdout_only, "WARNING: --include-unsupported",
             "warning stays on stderr, not in the document");
+    }
+
+    /*
+     * 20. --debug must expose the transport decision and the exact profile
+     *     answers libsairedis receives, must time the library calls, and
+     *     must stay off stdout so JSON stays parseable. The fake adapter
+     *     ignores the profile, so the dump is printed by the tool itself
+     *     from the same source of truth the profile callback uses.
+     */
+    {
+        const std::string merged = run("--debug 0x21000000000000");
+        expect_contains(
+            merged,
+            "debug: transport=client",
+            "debug prints the default transport");
+        expect_contains(
+            merged,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = true",
+            "debug prints the profile answer libsairedis receives");
+        expect_contains(
+            merged,
+            "debug:   SAI_REDIS_CONTEXT_CONFIG = (nullptr)",
+            "absent configs are printed as nullptr");
+        expect_contains(
+            merged,
+            "debug: sai_api_initialize took",
+            "debug times the library calls");
+
+        const std::string stdout_only =
+            run_stdout_only("--debug --format json 0x21000000000000");
+        expect_contains(
+            stdout_only,
+            "\"schema_version\": 1",
+            "json still produced with --debug");
+        expect_not_contains(
+            stdout_only,
+            "debug:",
+            "debug output stays off stdout in json mode");
+
+        const std::string server = run("--debug --server 0x21000000000000");
+        expect_contains(
+            server,
+            "debug: transport=server",
+            "debug prints the server transport");
+        expect_contains(
+            server,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = false",
+            "server mode answers false");
+    }
+
+    /*
+     * 21. SAI_CAP_ENABLE_CLIENT must override the profile answer exactly:
+     *     "false" forces the server role, "unset" answers nullptr like the
+     *     builds that predate client-mode support, and an unrecognized value
+     *     must be ignored rather than half-honoured.
+     */
+    {
+        const std::string forced =
+            run_env("SAI_CAP_ENABLE_CLIENT=false", "--debug 0x21000000000000");
+        expect_contains(
+            forced,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = false",
+            "false override forces the server role");
+
+        const std::string unset =
+            run_env(
+                "SAI_CAP_ENABLE_CLIENT=unset", "--debug 0x21000000000000");
+        expect_contains(
+            unset,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = (nullptr)",
+            "unset override answers nullptr (pre-client-mode behaviour)");
+
+        const std::string bogus =
+            run_env(
+                "SAI_CAP_ENABLE_CLIENT=nonsense",
+                "--debug 0x21000000000000");
+        expect_contains(
+            bogus,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = true",
+            "unknown override keeps the default answer");
     }
 
     std::printf("------------------------------------\n");
