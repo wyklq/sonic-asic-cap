@@ -450,6 +450,37 @@ compare_attribute_capability_with_condition(
     return Agreement::Unverifiable;
 }
 
+/*
+ * Combine the states of the two independent SAI condition predicates.
+ *
+ * isconditional and isvalidonly are separate flags, and the metadata
+ * evaluators are flag-specific: sai_metadata_is_condition_met returns false
+ * for an attribute that is not conditional, and sai_metadata_is_validonly_met
+ * returns false for an attribute that is not valid-only
+ * (include/meta/saimetadatautils.h). An attribute carrying both flags is
+ * only in force when every predicate is met, so the combination is:
+ *
+ *   - NotMet by either predicate means definitively not in force, even if
+ *     the other predicate could not be evaluated;
+ *   - otherwise any Unknown keeps the attribute unverifiable;
+ *   - only all-Met promotes the attribute to "in force".
+ *
+ * The ordering matters for safety: a contradiction may only be asserted
+ * from a positively determined Met, and this function never produces Met
+ * from a partially evaluated pair.
+ */
+inline ConditionState
+combine_condition_states(ConditionState a, ConditionState b)
+{
+    if (a == ConditionState::NotMet || b == ConditionState::NotMet) {
+        return ConditionState::NotMet;
+    }
+    if (a == ConditionState::Unknown || b == ConditionState::Unknown) {
+        return ConditionState::Unknown;
+    }
+    return ConditionState::Met;
+}
+
 inline std::string
 format_api_version(sai_api_version_t version)
 {

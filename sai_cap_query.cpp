@@ -2262,40 +2262,38 @@ sai_object_id_t
 select_sample_port(const std::vector<sai_object_id_t> &ports);
 
 /*
- * Read the attributes a condition depends on, so the SAI metadata condition
- * evaluator can be run against live values instead of defaults.
+ * Read the attributes one condition predicate depends on, so the SAI
+ * metadata condition evaluator can be run against live values instead of
+ * defaults.
  *
  * Only attributes that can be read are passed through; if any referenced
- * attribute cannot be read, the condition is reported as Unknown rather than
+ * attribute cannot be read, the predicate is reported as Unknown rather than
  * being silently evaluated against its default (which could differ from the
  * live value and yield a wrong verdict).
+ *
+ * conditional_predicate selects the evaluator and must match the flag whose
+ * list is passed in: sai_metadata_is_condition_met answers false for an
+ * attribute that is not conditional, and sai_metadata_is_validonly_met
+ * answers false for one that is not valid-only (see
+ * include/meta/saimetadatautils.h), so the two lists cannot share an
+ * evaluator.
  */
 ConditionState
-evaluate_attribute_condition(
+evaluate_condition_list(
     const sai_attr_metadata_t *metadata,
     const sai_object_type_info_t *info,
-    const AttributeGetter &getter)
+    const AttributeGetter &getter,
+    const sai_attr_condition_t *const *list,
+    size_t count,
+    bool conditional_predicate)
 {
-    const bool is_conditional = metadata->isconditional;
-    const bool is_validonly = metadata->isvalidonly;
-
-    if (!is_conditional && !is_validonly) {
-        return ConditionState::Met;
-    }
-
-    const size_t count = is_conditional
-        ? metadata->conditionslength
-        : metadata->validonlylength;
-    const sai_attr_condition_t *const *list = is_conditional
-        ? metadata->conditions
-        : metadata->validonly;
-
     if (count == 0 || list == nullptr) {
         return ConditionState::Unknown;
     }
 
     std::vector<sai_attribute_t> attributes;
     attributes.reserve(count);
+    size_t usable = 0;
 
     for (size_t i = 0; i < count; ++i) {
         const sai_attr_condition_t *condition = list[i];
@@ -2343,19 +2341,74 @@ evaluate_attribute_condition(
          * a pointer-backed type, this copy must be revisited.
          */
         attributes.push_back(attribute);
+        ++usable;
     }
 
-    const bool met = is_conditional
+    /*
+     * No usable predicate entry (every entry was null): calling the evaluator
+     * with an empty list would let it fall back to the referenced attributes'
+     * default values, which this function exists to avoid.
+     */
+    if (usable == 0) {
+        return ConditionState::Unknown;
+    }
+
+    const bool met = conditional_predicate
         ? sai_metadata_is_condition_met(
               metadata,
               static_cast<uint32_t>(attributes.size()),
-              attributes.empty() ? nullptr : attributes.data())
+              attributes.data())
         : sai_metadata_is_validonly_met(
               metadata,
               static_cast<uint32_t>(attributes.size()),
-              attributes.empty() ? nullptr : attributes.data());
+              attributes.data());
 
     return met ? ConditionState::Met : ConditionState::NotMet;
+}
+
+/*
+ * Evaluate an attribute's conditions on the sampled object.
+ *
+ * isconditional and isvalidonly are independent predicates, each with its own
+ * condition list and its own metadata evaluator. A single
+ * `isconditional ? conditions : validonly` selection under-evaluates an
+ * attribute carrying both flags: a NotMet valid-only condition could be
+ * masked by a Met conditions list, the attribute wrongly treated as in force,
+ * and a failed GET promoted to a false CONTRADICTION.
+ *
+ * Every flag the attribute carries is evaluated, and the results are combined
+ * by combine_condition_states, which yields Met only when all of them are Met.
+ */
+ConditionState
+evaluate_attribute_condition(
+    const sai_attr_metadata_t *metadata,
+    const sai_object_type_info_t *info,
+    const AttributeGetter &getter)
+{
+    ConditionState state = ConditionState::Met;
+
+    if (metadata->isconditional) {
+        state = evaluate_condition_list(
+            metadata,
+            info,
+            getter,
+            metadata->conditions,
+            metadata->conditionslength,
+            true);
+    }
+
+    if (metadata->isvalidonly) {
+        const ConditionState validonly = evaluate_condition_list(
+            metadata,
+            info,
+            getter,
+            metadata->validonly,
+            metadata->validonlylength,
+            false);
+        state = combine_condition_states(state, validonly);
+    }
+
+    return state;
 }
 
 void

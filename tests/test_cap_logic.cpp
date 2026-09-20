@@ -570,6 +570,62 @@ test_condition_aware_agreement()
         "successful GET agrees regardless of condition state");
 }
 
+/* ------------------------------------------------------------------ */
+/* combining the two independent condition predicates                  */
+/* ------------------------------------------------------------------ */
+
+void
+test_combine_condition_states()
+{
+    using cap::combine_condition_states;
+    using cap::ConditionState;
+
+    auto name = [](ConditionState state) {
+        switch (state) {
+            case ConditionState::Met:
+                return "MET";
+            case ConditionState::NotMet:
+                return "NOTMET";
+            case ConditionState::Unknown:
+                return "UNKNOWN";
+        }
+        return "?";
+    };
+
+    /* The identity element: an attribute with one flag behaves as before. */
+    expect_eq(
+        name(combine_condition_states(ConditionState::Met, ConditionState::Met)),
+        "MET",
+        "all predicates met means in force");
+    expect_eq(
+        name(combine_condition_states(ConditionState::Met, ConditionState::NotMet)),
+        "NOTMET",
+        "a not-met validonly masks a met condition");
+    expect_eq(
+        name(combine_condition_states(ConditionState::NotMet, ConditionState::Met)),
+        "NOTMET",
+        "a not-met condition masks a met validonly");
+    expect_eq(
+        name(combine_condition_states(ConditionState::Met, ConditionState::Unknown)),
+        "UNKNOWN",
+        "an unevaluated predicate keeps the attribute unverifiable");
+
+    /*
+     * A definitively not-met predicate settles the verdict even when the
+     * other predicate could not be evaluated; both outcomes keep a failed GET
+     * out of contradiction territory, so this is purely a reporting
+     * refinement.
+     */
+    expect_eq(
+        name(combine_condition_states(ConditionState::Unknown, ConditionState::NotMet)),
+        "NOTMET",
+        "a not-met predicate dominates an unknown one");
+    expect_eq(
+        name(combine_condition_states(ConditionState::Unknown, ConditionState::Unknown)),
+        "UNKNOWN",
+        "two unevaluated predicates stay unknown");
+}
+
 } // namespace
 
 int
@@ -591,6 +647,7 @@ main()
     test_attribute_capability_agreement();
     test_condition_evaluability();
     test_condition_aware_agreement();
+    test_combine_condition_states();
 
     std::printf("--------------------\n");
     std::printf(
