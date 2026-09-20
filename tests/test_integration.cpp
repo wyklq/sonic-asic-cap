@@ -111,6 +111,30 @@ main(int argc, char **argv)
         return output;
     };
 
+    /*
+     * Extract one top-level member of the pretty-printed JSON document so a
+     * section can be examined without a full parser. A top-level member's
+     * closing bracket is the first "\n  ]" / "\n  }" after its opening
+     * bracket, because nested content is always indented deeper.
+     */
+    auto json_section = [](const std::string &json, const std::string &key) {
+        const std::string marker = "\n  \"" + key + "\": ";
+        const size_t start = json.find(marker);
+        if (start == std::string::npos) {
+            return std::string();
+        }
+        const size_t open = start + marker.size();
+        if (open >= json.size()) {
+            return std::string();
+        }
+        const char close = json[open] == '[' ? ']' : '}';
+        const size_t end = json.find("\n  " + std::string(1, close), open);
+        if (end == std::string::npos) {
+            return json.substr(start);
+        }
+        return json.substr(start, end - start);
+    };
+
     /* 1. A bad VID must fail loudly and must NOT produce a capability report. */
     {
         const std::string out = run("--object PORT 0x99999999999999");
@@ -362,6 +386,66 @@ main(int argc, char **argv)
         const std::string out = run("--format xml 0x21000000000000");
         expect_contains(out, "Invalid --format", "bad format is rejected");
         expect_contains(out, "[exit=2]", "bad format exits 2");
+    }
+
+    /*
+     * 18. JSON sweeps must follow the text report's cost model: without
+     *     --all/--object the object-type sweeps are restricted to the focused
+     *     type lists, and object types the adapter's
+     *     SUPPORTED_OBJECT_TYPE_LIST excludes are never live-queried. The
+     *     fake advertises only SWITCH, PORT and NEXT_HOP; QUEUE carries stats
+     *     but is outside the attribute-focused list, while NEXT_HOP sits
+     *     outside the statistics-focused list.
+     */
+    {
+        const std::string default_out =
+            run_stdout_only("--format json 0x21000000000000");
+        const std::string all_out =
+            run_stdout_only("--format json --all 0x21000000000000");
+
+        const std::string default_stats =
+            json_section(default_out, "statistics_capabilities");
+        expect_contains(
+            default_stats,
+            "SAI_OBJECT_TYPE_QUEUE",
+            "default stats sweep covers focused types");
+        expect_not_contains(
+            default_stats,
+            "SAI_OBJECT_TYPE_NEXT_HOP",
+            "default stats sweep skips non-focused types");
+
+        const std::string all_stats =
+            json_section(all_out, "statistics_capabilities");
+        expect_contains(
+            all_stats,
+            "SAI_OBJECT_TYPE_PORT",
+            "--all stats sweep covers advertised types");
+        expect_not_contains(
+            all_stats,
+            "SAI_OBJECT_TYPE_QUEUE",
+            "--all stats sweep skips unadvertised types");
+
+        const std::string all_caps =
+            json_section(all_out, "attribute_capabilities");
+        expect_contains(
+            all_caps, "\"queried\": true",
+            "advertised types are live-queried");
+        expect_contains(
+            all_caps, "\"queried\": false",
+            "unadvertised types are not live-queried");
+        expect_contains(
+            all_caps, "\"verdict\"", "skipped types carry a verdict");
+        expect_contains(
+            all_out,
+            "\"create_implemented\": true",
+            "queried capability fields are still present");
+
+        const std::string default_caps =
+            json_section(default_out, "attribute_capabilities");
+        expect_not_contains(
+            default_caps,
+            "SAI_OBJECT_TYPE_NEXT_HOP",
+            "default attribute sweep is restricted to focused types");
     }
 
     std::printf("------------------------------------\n");

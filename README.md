@@ -76,7 +76,7 @@ Top-level keys (`schema_version` is currently `1`):
 | `switch_vid`, `transport`, `object_filter`, `all`, `include_unsupported`, `probe_stats`, `verify_attributes` | request echo |
 | `supported_object_types` | `authoritative` flag plus each advertised type, whether it is known to the local metadata, and whether it is experimental/vendor-custom |
 | `switch_attributes` | read-only switch attributes only (a GET is meaningless on create/set-only attributes, which the text report also excludes): per-attribute `result` bucket (`ok` / `skipped_by_tool` / normalized failure) and value |
-| `attribute_capabilities` | per attribute: `asic_supported`, `create/set/get_implemented`, `conditional`, `valid_only`, `deprecated` |
+| `attribute_capabilities` | per attribute: `asic_supported`, `queried`, `conditional`, `valid_only`, `deprecated`; when `queried` is true also `status` and `create/set/get_implemented`. An object type the adapter's `SUPPORTED_OBJECT_TYPE_LIST` excludes is reported from metadata only (`queried: false`, plus `verdict`), with no per-attribute capability round trip — same policy as the text scan |
 | `statistics_capabilities` | per object type: `counters` with `modes`, plus nested `stream_telemetry` with `minimal_polling_interval_ns` |
 | `resource_availability` | per object type: `status` and `available` |
 
@@ -85,6 +85,12 @@ consumers are expected to filter, and silently dropping data would be worse
 than a large document. `--probe-stats` and `--verify-attributes` are
 line-oriented and are reported (on stderr) as excluded from JSON mode rather
 than being silently omitted.
+
+JSON mode follows the text report's cost model: without `--all` or
+`--object`, the object-type sweeps (`statistics_capabilities`,
+`resource_availability`) are restricted to the same focused type lists the
+text report uses, and `attribute_capabilities` skips object types the
+authoritative supported list excludes.
 
 ## P1 coverage
 

@@ -3024,8 +3024,14 @@ build_json_report(
      * Attribute capability declarations.
      *
      * This is the most expensive section (one round trip per attribute in the
-     * whole schema). Mirror the text path: scan everything only with --all or
-     * an --object filter, otherwise restrict to the focused object types.
+     * whole schema). Mirror the text path in two ways:
+     *   - scan everything only with --all or an --object filter, otherwise
+     *     restrict to the focused object types;
+     *   - when the adapter published an authoritative object list and a type
+     *     is absent from it, do not spend a round trip per attribute asking
+     *     about support for an object type the adapter itself excluded. The
+     *     metadata-derived fields are still reported, and `verdict` explains
+     *     why the live declaration is missing.
      */
     {
         static const sai_object_type_t focused_types[] = {
@@ -3063,11 +3069,44 @@ build_json_report(
             const bool asic_supported =
                 supported.authoritative &&
                 supported.is_supported(info->objecttype);
+            const bool query_capability =
+                !supported.authoritative || asic_supported;
             for (size_t j = 0;
                  info->attrmetadata[j] != nullptr;
                  ++j) {
                 const sai_attr_metadata_t *metadata =
                     info->attrmetadata[j];
+
+                JsonValue entry = JsonValue::make_object();
+                entry.set(
+                    "object_type",
+                    JsonValue::make_string(info->objecttypename));
+                entry.set(
+                    "asic_supported",
+                    JsonValue::make_bool(asic_supported));
+                entry.set(
+                    "name",
+                    JsonValue::make_string(metadata->attridname));
+
+                if (!query_capability) {
+                    entry.set(
+                        "verdict",
+                        JsonValue::make_string(
+                            supported.verdict(info->objecttype)));
+                    entry.set("queried", JsonValue::make_bool(false));
+                    entry.set(
+                        "conditional",
+                        JsonValue::make_bool(metadata->isconditional));
+                    entry.set(
+                        "valid_only",
+                        JsonValue::make_bool(metadata->isvalidonly));
+                    entry.set(
+                        "deprecated",
+                        JsonValue::make_bool(metadata->isdeprecated));
+                    capabilities_json.push(std::move(entry));
+                    continue;
+                }
+
                 sai_attr_capability_t capability{};
                 sai_status_t status = SAI_STATUS_FAILURE;
                 try {
@@ -3080,16 +3119,7 @@ build_json_report(
                     status = SAI_STATUS_FAILURE;
                 }
 
-                JsonValue entry = JsonValue::make_object();
-                entry.set(
-                    "object_type",
-                    JsonValue::make_string(info->objecttypename));
-                entry.set(
-                    "asic_supported",
-                    JsonValue::make_bool(asic_supported));
-                entry.set(
-                    "name",
-                    JsonValue::make_string(metadata->attridname));
+                entry.set("queried", JsonValue::make_bool(true));
                 entry.set(
                     "status",
                     JsonValue::make_string(format_status(status)));
@@ -3122,22 +3152,27 @@ build_json_report(
     }
 
     /* Statistics capabilities. */
+    /*
+     * Statistics capabilities.
+     *
+     * Mirror show_stats_capabilities: without --all or an --object filter,
+     * restrict the sweep to the focused object types instead of querying
+     * stats and stream-telemetry capability for every supported type.
+     */
     {
-        JsonValue stats_json = JsonValue::make_array();
-        for (size_t i = 1;
-             sai_metadata_all_object_type_infos[i] != nullptr;
-             ++i) {
-            const sai_object_type_info_t *info =
-                sai_metadata_all_object_type_infos[i];
-            if (info->statenum == nullptr ||
-                !object_name_matches(info->objecttypename, options.object_filter)) {
-                continue;
-            }
-            if (supported.authoritative &&
-                !supported.is_supported(info->objecttype)) {
-                continue;
-            }
+        static const sai_object_type_t focused_types[] = {
+            SAI_OBJECT_TYPE_PORT,
+            SAI_OBJECT_TYPE_QUEUE,
+            SAI_OBJECT_TYPE_INGRESS_PRIORITY_GROUP,
+            SAI_OBJECT_TYPE_ROUTER_INTERFACE,
+            SAI_OBJECT_TYPE_SWITCH,
+        };
+        const bool full_scan =
+            options.all || !options.object_filter.empty();
 
+        JsonValue stats_json = JsonValue::make_array();
+
+        auto add_one = [&](const sai_object_type_info_t *info) {
             const StatsCapabilityResult &result = stats_cache.get(info);
             const StatsStCapabilityResult st_result =
                 query_stats_st_capability(
@@ -3201,26 +3236,59 @@ build_json_report(
             entry.set("stream_telemetry", std::move(st_json));
 
             stats_json.push(std::move(entry));
+        };
+
+        if (!full_scan) {
+            for (sai_object_type_t type : focused_types) {
+                const sai_object_type_info_t *info =
+                    sai_metadata_get_object_type_info(type);
+                if (info != nullptr && info->statenum != nullptr) {
+                    add_one(info);
+                }
+            }
+        } else {
+            for (size_t i = 1;
+                 sai_metadata_all_object_type_infos[i] != nullptr;
+                 ++i) {
+                const sai_object_type_info_t *info =
+                    sai_metadata_all_object_type_infos[i];
+                if (info->statenum == nullptr ||
+                    !object_name_matches(
+                        info->objecttypename, options.object_filter)) {
+                    continue;
+                }
+                if (supported.authoritative &&
+                    !supported.is_supported(info->objecttype)) {
+                    continue;
+                }
+                add_one(info);
+            }
         }
         root.set("statistics_capabilities", std::move(stats_json));
     }
 
-    /* Generic resource availability. */
+    /*
+     * Generic resource availability.
+     *
+     * Mirror show_generic_availability: without --all or an --object filter,
+     * restrict the sweep to the focused object types instead of querying
+     * availability for every supported type.
+     */
     {
-        JsonValue availability_json = JsonValue::make_array();
-        for (size_t i = 1;
-             sai_metadata_all_object_type_infos[i] != nullptr;
-             ++i) {
-            const sai_object_type_info_t *info =
-                sai_metadata_all_object_type_infos[i];
-            if (!object_name_matches(info->objecttypename, options.object_filter)) {
-                continue;
-            }
-            if (supported.authoritative &&
-                !supported.is_supported(info->objecttype)) {
-                continue;
-            }
+        static const sai_object_type_t focused_types[] = {
+            SAI_OBJECT_TYPE_ROUTE_ENTRY,
+            SAI_OBJECT_TYPE_NEXT_HOP,
+            SAI_OBJECT_TYPE_NEXT_HOP_GROUP,
+            SAI_OBJECT_TYPE_NEXT_HOP_GROUP_MEMBER,
+            SAI_OBJECT_TYPE_FDB_ENTRY,
+            SAI_OBJECT_TYPE_ACL_ENTRY,
+        };
+        const bool full_scan =
+            options.all || !options.object_filter.empty();
 
+        JsonValue availability_json = JsonValue::make_array();
+
+        auto add_one = [&](const sai_object_type_info_t *info) {
             uint64_t count = 0;
             sai_status_t status = SAI_STATUS_FAILURE;
             try {
@@ -3250,6 +3318,32 @@ build_json_report(
                     JsonValue::make_uint(count));
             }
             availability_json.push(std::move(entry));
+        };
+
+        if (!full_scan) {
+            for (sai_object_type_t type : focused_types) {
+                const sai_object_type_info_t *info =
+                    sai_metadata_get_object_type_info(type);
+                if (info != nullptr) {
+                    add_one(info);
+                }
+            }
+        } else {
+            for (size_t i = 1;
+                 sai_metadata_all_object_type_infos[i] != nullptr;
+                 ++i) {
+                const sai_object_type_info_t *info =
+                    sai_metadata_all_object_type_infos[i];
+                if (!object_name_matches(
+                        info->objecttypename, options.object_filter)) {
+                    continue;
+                }
+                if (supported.authoritative &&
+                    !supported.is_supported(info->objecttype)) {
+                    continue;
+                }
+                add_one(info);
+            }
         }
         root.set(
             "resource_availability",
