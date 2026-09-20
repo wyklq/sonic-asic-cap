@@ -2948,7 +2948,7 @@ build_json_report(
     supported_json.set("types", std::move(type_array));
     root.set("supported_object_types", std::move(supported_json));
 
-    /* Switch attributes (read-only sweep when --all). */
+    /* Switch attributes (read-only sweep). */
     {
         std::vector<const sai_attr_metadata_t *> attributes;
         const sai_object_type_info_t *switch_info =
@@ -2959,7 +2959,14 @@ build_json_report(
                  ++i) {
                 const sai_attr_metadata_t *metadata =
                     switch_info->attrmetadata[i];
-                if (!options.all || metadata->isreadonly) {
+                /*
+                 * Only read-only attributes are swept. A GET is meaningless
+                 * on create/set-only attributes (the adapter is expected to
+                 * reject it), so querying them would only add failures and
+                 * round trips; the text report's --all sweep applies the
+                 * same restriction.
+                 */
+                if (metadata->isreadonly) {
                     attributes.push_back(metadata);
                 }
             }
