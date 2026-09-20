@@ -61,7 +61,7 @@ SAI_CAP_ENABLE_CLIENT=unset ./sai_cap_query --debug 0x21000000000000
 | code | meaning |
 |------|---------|
 | 0 | report produced |
-| 1 | SAI initialization / transport-setup failure (including the client-mode ZMQ endpoint preflight) |
+| 1 | SAI initialization / transport-setup failure (including the ZMQ endpoint preflight, both roles) |
 | 2 | bad command line |
 | 3 | switch VID did not validate (refused to run) |
 
@@ -102,13 +102,59 @@ with those builds and refuses to report with the client default.
   answer for one run; `unset` (also `none`/`absent`) answers `nullptr`,
   reproducing the pre-`--client` builds exactly. This is the bisect knob for
   "which role does this box actually serve".
-* Before `sai_api_initialize`, a client-mode run without `--client-config`
-  checks that the built-in ZMQ endpoints (`/tmp/zmq_ep`, `/tmp/zmq_ntf_ep`)
-  exist — they only exist when `syncd` runs with `-z`. A missing endpoint
-  exits 1 immediately with the two fixes (run `syncd -z`, or query through the
-  Redis channel with `SAI_CAP_ENABLE_CLIENT=false` / `--server`) instead of
-  hanging until the 60 s response timeout. `SAI_CAP_ZMQ_PRECHECK=0` skips the
-  preflight to observe the raw wait-and-fail behaviour.
+* Before `sai_api_initialize`, the run preflights the built-in ZMQ
+  endpoints (the role decides which pair matters — see
+  *Containers and namespaces* below):
+  * client mode (no `--client-config`) needs a **live** sairedis server
+    endpoint to connect to. It checks `ipc:///tmp/saiServer` +
+    `ipc:///tmp/saiServerNtf` (the `client_config.json` defaults) and
+    `ipc:///tmp/zmq_ep` + `ipc:///tmp/zmq_ntf_ep` (the
+    `SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC` defaults). A missing — or
+    present-but-stale — endpoint exits 1 immediately with the fixes (run
+    `syncd -z`, use the Redis channel via `SAI_CAP_ENABLE_CLIENT=false` /
+    `--server`, or point elsewhere with `--client-config`) instead of
+    hanging until the 60 s response timeout.
+  * server mode (no `--server-config` / `--context-config`) BINDS the
+    endpoint, so nothing is wrong with a missing one — that is the normal
+    Redis-channel path. An endpoint that already exists means `syncd -z`
+    (or another sairedis process) owns it and `zmq_bind` would fail with
+    `EADDRINUSE`; the preflight reports that and points back at client
+    mode instead.
+  * `SAI_CAP_ZMQ_PRECHECK=0` skips the preflight to observe the raw
+    wait-and-fail behaviour.
+
+### Containers and namespaces (SONiC / docker)
+
+SONiC runs every service, `syncd` and the redis database included, in its
+own docker container, and **ZMQ `ipc://` endpoints are UNIX socket files in
+the namespaces of the process that created them**. A tool running on the
+host, or inside a different container, therefore cannot see `syncd`'s
+endpoints — the same holds for `tcp://` endpoints, which live in the
+network namespace. Options, in order of preference:
+
+1. **Run the tool inside the container that owns the endpoints.** For the
+   client role that is the container running `syncd -z`; for the
+   Redis-channel (server) role it just needs to reach the redis database,
+   i.e. the same network namespace as the database (or its published
+   port):
+   ```sh
+   docker exec <container> /path/to/sai_cap_query --server <VID>
+   ```
+2. **Share the namespace instead of placing the tool in it**:
+   `docker run --network container:<container> --ipc container:<container>
+   ...` gives the tool both the redis socket/port and the ZMQ endpoints.
+3. **Relocate the endpoint** so it lives somewhere the tool can reach:
+   mount the directory holding the socket into the tool's container, or
+   publish the endpoint (a `tcp://` one needs the port published) and point
+   the tool at it with `--client-config` / `--server-config` /
+   `--context-config`. The preflight skips the built-in defaults whenever a
+   config file is supplied, precisely because the defaults then say
+   nothing about the real endpoints.
+
+Note that client mode additionally requires `syncd` to run in synchronous
+ZMQ mode (`syncd -z`) at all — a stock async `syncd` exposes no sairedis
+server, in any namespace, and the Redis-channel path (`--server`) is the
+one that matches a normally running switch.
 * Exit code 3 (the switch VID did not validate) now prints the on-switch
   triage commands: whether the object is in the ASIC view, whether syncd
   serves ZMQ, and whether the client endpoints exist.

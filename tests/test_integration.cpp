@@ -11,7 +11,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 namespace {
 
@@ -81,11 +84,11 @@ main(int argc, char **argv)
     std::printf("------------------------------------\n");
 
     /*
-     * Every case below runs with the client-mode ZMQ endpoint preflight
-     * disabled: the fake adapter never binds /tmp/zmq_ep, so on a host
-     * without syncd the preflight would (correctly) fail every
-     * client-mode run before the tool logic under test is reached.
-     * Case 22 exercises the preflight itself with and without the
+     * Every case below runs with the ZMQ endpoint preflight disabled: the
+     * fake adapter never binds /tmp/saiServer, so on a host without
+     * syncd the preflight would (correctly) fail every client-mode run
+     * before the tool logic under test is reached. Cases 22 and 23
+     * exercise the preflight itself, both roles, with and without the
      * override.
      */
     auto run = [&](const std::string &args) {
@@ -633,13 +636,15 @@ main(int argc, char **argv)
      * 22. Client transport with no syncd to talk to must fail fast instead
      *     of waiting out the 60s response timeout. The endpoints are
      *     absent on every ordinary build host; on a host that runs
-     *     syncd -z they exist, so the positive assertions are skipped
+     *     syncd -z they exist, so the negative assertions are skipped
      *     there to keep the test honest. The kill switch must restore the
      *     unfailed path either way.
      */
     {
-        struct stat endpoint_stat{};
-        if (stat("/tmp/zmq_ep", &endpoint_stat) != 0) {
+        struct stat saiserver{};
+        struct stat zmq_ep{};
+        if (stat("/tmp/saiServer", &saiserver) != 0 &&
+            stat("/tmp/zmq_ep", &zmq_ep) != 0) {
             const std::string out =
                 run_full("--list-switches 0x21000000000000");
             expect_contains(
@@ -648,8 +653,16 @@ main(int argc, char **argv)
                 "missing ZMQ endpoint fails fast");
             expect_contains(
                 out,
-                "ZMQ endpoint /tmp/zmq_ep does not exist",
-                "the missing endpoint is named");
+                "/tmp/saiServer",
+                "the client_config.json default endpoint is named");
+            expect_contains(
+                out,
+                "/tmp/saiServerNtf",
+                "the client notification endpoint is named");
+            expect_contains(
+                out,
+                "/tmp/zmq_ep",
+                "the zmq-sync default endpoint is also named");
             expect_contains(
                 out,
                 "syncd -z",
@@ -668,8 +681,8 @@ main(int argc, char **argv)
                 "preflight failure runs no queries");
         } else {
             std::printf(
-                "skip preflight positive case "
-                "(/tmp/zmq_ep exists on this host)\n");
+                "skip client preflight negative case "
+                "(a sairedis endpoint exists on this host)\n");
         }
 
         const std::string suppressed = run("--list-switches 0x21000000000000");
@@ -681,6 +694,70 @@ main(int argc, char **argv)
             suppressed,
             "[exit=0]",
             "bypassed preflight still queries normally");
+    }
+
+    /*
+     * 23. Server mode has the opposite contract: it BINDS the endpoint, so
+     *     a live socket there (syncd -z or another sairedis process) must
+     *     fail fast instead of surfacing as EADDRINUSE deep inside
+     *     sai_api_initialize. Bind a throwaway listener to make that
+     *     state real, then drop it again.
+     */
+    {
+        struct stat endpoint_stat{};
+        if (stat("/tmp/saiServer", &endpoint_stat) != 0) {
+            const int holder = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (holder >= 0) {
+                sockaddr_un address{};
+                address.sun_family = AF_UNIX;
+                std::snprintf(
+                    address.sun_path, sizeof(address.sun_path), "/tmp/saiServer");
+                const bool bound =
+                    bind(holder, reinterpret_cast<sockaddr *>(&address),
+                         sizeof(address)) == 0;
+                if (bound) {
+                    const std::string out =
+                        run_full("--server 0x21000000000000");
+                    expect_contains(
+                        out,
+                        "FATAL: server transport cannot bind /tmp/saiServer",
+                        "endpoint already bound fails fast");
+                    expect_contains(
+                        out,
+                        "syncd -z",
+                        "the zmq-server owner is named");
+                    expect_contains(
+                        out,
+                        "[exit=1]",
+                        "server preflight failure exits 1");
+                    expect_not_contains(
+                        out,
+                        "=== Switch VID description ===",
+                        "server preflight failure runs no queries");
+                }
+                close(holder);
+                unlink("/tmp/saiServer");
+
+                const std::string suppressed =
+                    run("--server 0x21000000000000");
+                expect_contains(
+                    suppressed,
+                    "=== Switch VID description ===",
+                    "SAI_CAP_ZMQ_PRECHECK=0 bypasses the server preflight");
+                expect_contains(
+                    suppressed,
+                    "[exit=0]",
+                    "bypassed server preflight still queries normally");
+            } else {
+                std::fprintf(
+                    stderr,
+                    "cannot create probe socket: skipping case 23\n");
+            }
+        } else {
+            std::printf(
+                "skip server preflight case (/tmp/saiServer exists on this "
+                "host)\n");
+        }
     }
 
     std::printf("------------------------------------\n");

@@ -69,10 +69,20 @@ std::string sai_serialize_status(sai_status_t status);
 
 /*
  * POSIX stat(), used by the client-mode ZMQ endpoint preflight. The tool
- * targets Linux (where libsairedis and syncd run), so the POSIX header is
- * fine here.
+ * targets Linux (where libsairedis and syncd run), so the POSIX headers
+ * are fine here.
  */
 #include <sys/stat.h>
+
+/*
+ * UNIX-socket probe for the same preflight: a stale socket file left
+ * behind by a crashed syncd -z looks exactly like a live one on disk, and
+ * zmq_connect connects to both lazily. Connecting for real separates
+ * them, which is precisely what a sairedis client is about to do.
+ */
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 namespace {
 
@@ -3531,13 +3541,116 @@ env_switch_on(const char *name)
 }
 
 /*
- * ZMQ endpoints libsairedis connects to in client mode when no
- * client_config.json is supplied. These are the built-in defaults the
- * sairedis server side binds; they only exist when syncd runs in
- * synchronous mode (syncd -z).
+ * ZMQ endpoints libsairedis falls back to when no *config.json is
+ * supplied. Two default pairs exist in the wild, depending on which code
+ * path the linked libsairedis build takes:
+ *
+ *   ClientConfig / ServerConfig defaults (no client_config.json /
+ *   server_config.json): ipc:///tmp/saiServer + ipc:///tmp/saiServerNtf
+ *   (current sonic-sairedis; the context config is explicitly NOT used by
+ *   the client path)
+ *
+ *   SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC defaults (no context config):
+ *   ipc:///tmp/zmq_ep + ipc:///tmp/zmq_ntf_ep
+ *
+ * Both are UNIX socket files: they live in the filesystem namespace of the
+ * process that created them. When syncd runs in a docker container, the
+ * sairedis server endpoints exist inside that container's namespaces and
+ * are invisible to a tool running on the host or in another container,
+ * unless the path is shared through a volume or the endpoint is published
+ * out. A context-config-driven build can also use tcp:// endpoints
+ * (context defaults 127.0.0.1:5555 / 5556), invisible across network
+ * namespaces for the same reason.
+ *
+ * The two roles expect opposite things of the very same paths:
+ *   - the client CONNECTS the main endpoint (the sairedis server inside
+ *     syncd binds it) and BINDS the notification endpoint itself, so the
+ *     main endpoint must already exist and the ntf endpoint must not;
+ *   - the server BINDS the main endpoint and then forwards every call to
+ *     syncd over the Redis channel, so it requires neither to exist --
+ *     a missing endpoint is the normal case there.
+ * Neither library side reports the mistakes usefully: zmq_connect to a
+ * missing ipc:// path succeeds lazily, and a client pointed at an endpoint
+ * it cannot see waits out the full 60s response timeout before failing,
+ * while zmq_bind to an owned endpoint fails deep inside
+ * sai_api_initialize -- hence the preflight in main().
  */
-constexpr const char *kDefaultClientChannelPath = "/tmp/zmq_ep";
-constexpr const char *kDefaultClientNtfChannelPath = "/tmp/zmq_ntf_ep";
+struct ZmqEndpoints
+{
+    const char *main;
+    const char *ntf;
+};
+
+constexpr ZmqEndpoints kDefaultClientEndpoints[] = {
+    {"/tmp/saiServer", "/tmp/saiServerNtf"},
+    {"/tmp/zmq_ep", "/tmp/zmq_ntf_ep"},
+};
+
+/* The pair a server-role instance binds when no server_config.json is
+ * given (ServerConfig defaults). */
+constexpr ZmqEndpoints kDefaultServerEndpoints = {
+    "/tmp/saiServer",
+    "/tmp/saiServerNtf"};
+
+enum class EndpointState
+{
+    Missing,
+    Socket,
+    Other,
+};
+
+EndpointState
+endpoint_state(const char *path)
+{
+    struct stat endpoint_stat{};
+
+    if (stat(path, &endpoint_stat) != 0) {
+        return EndpointState::Missing;
+    }
+
+    return S_ISSOCK(endpoint_stat.st_mode) ? EndpointState::Socket
+                                           : EndpointState::Other;
+}
+
+const char *
+endpoint_state_text(EndpointState state)
+{
+    switch (state) {
+    case EndpointState::Missing:
+        return "missing";
+    case EndpointState::Socket:
+        return "socket";
+    case EndpointState::Other:
+        return "not a socket";
+    }
+
+    return "unknown";
+}
+
+/* True when something is listening on the UNIX socket at path right now. */
+bool
+endpoint_live(const char *path)
+{
+    const int probe = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (probe < 0) {
+        return false;
+    }
+
+    sockaddr_un address{};
+
+    address.sun_family = AF_UNIX;
+    std::snprintf(address.sun_path, sizeof(address.sun_path), "%s", path);
+
+    const bool live = connect(
+                           probe,
+                           reinterpret_cast<sockaddr *>(&address),
+                           sizeof(address)) == 0;
+
+    close(probe);
+
+    return live;
+}
 
 /*
  * Single source of truth for every SAI_REDIS_KEY_* answer this process
@@ -3939,54 +4052,181 @@ main(int argc, char **argv)
     }
 
     /*
-     * Client mode sends every request to the sairedis server embedded in
-     * syncd over ZMQ channels. Without --client-config those channels are
-     * the built-in defaults, which only exist when syncd runs in
-     * synchronous mode (syncd -z). Against an async syncd each request
-     * would sit unanswered until the 60s synchronous-response timeout and
-     * only then fail, so verify the endpoints first and fail in
-     * milliseconds with an actionable message instead.
+     * Transport preflight. The two transports have opposite expectations
+     * about the ZMQ endpoints, and neither library side reports the
+     * problem usefully: zmq_connect to a missing ipc:// path succeeds
+     * lazily (every request then waits out the 60s response timeout), and
+     * zmq_bind to an endpoint someone already owns fails deep inside
+     * sai_api_initialize. Check the filesystem first so the common
+     * deployment mistakes fail in milliseconds with advice.
      *
-     * A supplied client_config.json relocates the channels, so the
-     * built-in defaults say nothing about it and the check is skipped.
+     * A supplied *_config.json relocates the endpoints, so the built-in
+     * defaults say nothing about that setup and the check is skipped (for
+     * the server role a context config can relocate them too, through
+     * SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC).
      * SAI_CAP_ZMQ_PRECHECK=0 restores the old wait-and-fail behaviour for
      * diagnosis.
      */
-    if (state->transport == Transport::Client &&
-        options.client_config.empty() &&
-        env_switch_on("SAI_CAP_ZMQ_PRECHECK")) {
-        const char *const endpoints[] = {
-            kDefaultClientChannelPath,
-            kDefaultClientNtfChannelPath,
-        };
-        for (const char *endpoint : endpoints) {
-            struct stat endpoint_stat{};
-            if (stat(endpoint, &endpoint_stat) != 0) {
+    const bool endpoints_relocated =
+        (state->transport == Transport::Client &&
+         !options.client_config.empty()) ||
+        (state->transport == Transport::Server &&
+         (!options.server_config.empty() || !options.context_config.empty()));
+
+    if (env_switch_on("SAI_CAP_ZMQ_PRECHECK") && !endpoints_relocated) {
+        if (state->transport == Transport::Client) {
+            /*
+             * Client mode CONNECTS to the sairedis server embedded in
+             * syncd, so that server must be reachable at the endpoint
+             * first. Find which default pair is in use instead of
+             * discovering the missing one, one 60s timeout per request at
+             * a time. A socket path with nothing behind it is called out
+             * separately: it is a crashed syncd -z, not a missing one.
+             */
+            const ZmqEndpoints *server_pair = nullptr;
+            const ZmqEndpoints *stale_pair = nullptr;
+            for (const ZmqEndpoints &pair : kDefaultClientEndpoints) {
+                if (endpoint_state(pair.main) != EndpointState::Socket) {
+                    continue;
+                }
+                if (endpoint_live(pair.main)) {
+                    server_pair = &pair;
+                    break;
+                }
+                if (stale_pair == nullptr) {
+                    stale_pair = &pair;
+                }
+            }
+
+            if (server_pair == nullptr) {
                 std::fprintf(
                     stderr,
-                    "FATAL: client transport cannot reach syncd: ZMQ "
-                    "endpoint %s does not exist.\n"
-                    "  In client mode every request goes to the sairedis "
-                    "server embedded in syncd\n"
-                    "  over ZMQ; those endpoints only exist when syncd runs "
-                    "in synchronous\n"
-                    "  mode (syncd -z). Without them each call waits out "
-                    "the 60s response\n"
-                    "  timeout before failing.\n"
-                    "  On the switch, either:\n"
-                    "    - run syncd in synchronous mode (syncd -z) so it "
-                    "serves this client,\n"
-                    "      or\n"
-                    "    - query through the Redis channel like the builds "
-                    "that predate --client:\n"
-                    "      SAI_CAP_ENABLE_CLIENT=false (equivalently "
-                    "--server), or\n"
-                    "    - point the client at another server with "
-                    "--client-config <file>.\n"
+                    "FATAL: client transport cannot reach syncd: no sairedis "
+                    "server endpoint exists in this namespace.\n"
+                    "  In client mode every request is CONNECTed to the "
+                    "sairedis server embedded in\n"
+                    "  syncd over ZMQ. zmq_connect succeeds even when nothing "
+                    "is listening, so without\n"
+                    "  the endpoint each call just waits out the full 60s "
+                    "response timeout before\n"
+                    "  failing. Checked the built-in defaults:\n");
+                for (const ZmqEndpoints &pair : kDefaultClientEndpoints) {
+                    std::fprintf(
+                        stderr,
+                        "    main %-20s %-12s ntf %-20s %s\n",
+                        pair.main,
+                        endpoint_state_text(endpoint_state(pair.main)),
+                        pair.ntf,
+                        endpoint_state_text(endpoint_state(pair.ntf)));
+                }
+                if (stale_pair != nullptr) {
+                    std::fprintf(
+                        stderr,
+                        "  %s exists as a socket but nothing is listening on "
+                        "it: a stale endpoint left\n"
+                        "  behind by a crashed syncd -z. Remove it and start "
+                        "syncd -z again, or point\n"
+                        "  elsewhere with --client-config <file>.\n",
+                        stale_pair->main);
+                }
+                std::fprintf(
+                    stderr,
+                    "  Either:\n"
+                    "    - syncd is not serving ZMQ at all: that is the "
+                    "normal case (an async syncd\n"
+                    "      exposes no ZMQ endpoint). Run it in synchronous "
+                    "mode (syncd -z) to serve\n"
+                    "      this client, or\n"
+                    "    - the endpoint exists but not HERE: ipc:// endpoints "
+                    "are UNIX socket files\n"
+                    "      living in the namespaces of the container that "
+                    "created them. If syncd runs in\n"
+                    "      a docker container, run this tool inside that "
+                    "same container (docker exec\n"
+                    "      <container> ...), share its IPC namespace, mount "
+                    "the directory holding the\n"
+                    "      socket, or publish the endpoint out and point the "
+                    "client at it with\n"
+                    "      --client-config <file>, or\n"
+                    "    - drop client mode and use the Redis channel, which "
+                    "works against a normal\n"
+                    "      async syncd: --server (equivalently "
+                    "SAI_CAP_ENABLE_CLIENT=false).\n"
+                    "  Set SAI_CAP_ZMQ_PRECHECK=0 to bypass this "
+                    "preflight.\n");
+                return 1;
+            }
+
+            /*
+             * The main endpoint the client connects to is live. This
+             * process also BINDS the notification endpoint, so a leftover
+             * there (a crashed sibling client) turns into EADDRINUSE
+             * inside sai_api_initialize; keep it visible up front.
+             */
+            const EndpointState ntf_state = endpoint_state(server_pair->ntf);
+            if (ntf_state != EndpointState::Missing) {
+                std::fprintf(
+                    stderr,
+                    "WARNING: notification endpoint %s is %s; this process "
+                    "binds it and an existing socket\n"
+                    "  makes zmq_bind fail with EADDRINUSE. If "
+                    "sai_api_initialize fails right after this\n"
+                    "  line, remove the file or relocate the endpoint with "
+                    "--client-config <file>.\n",
+                    server_pair->ntf,
+                    endpoint_state_text(ntf_state));
+            }
+
+            if (options.debug) {
+                std::fprintf(
+                    stderr,
+                    "debug: client endpoints: main=%s (connect), ntf=%s "
+                    "(bind)\n",
+                    server_pair->main,
+                    server_pair->ntf);
+            }
+        } else {
+            /*
+             * Server mode BINDS the endpoint. A missing path is the normal
+             * case -- it is how every build that talks to syncd over the
+             * Redis channel has always worked -- but an existing one means
+             * syncd -z or another sairedis process already owns it and
+             * zmq_bind fails with EADDRINUSE.
+             */
+            const EndpointState main_state =
+                endpoint_state(kDefaultServerEndpoints.main);
+
+            if (main_state != EndpointState::Missing) {
+                std::fprintf(
+                    stderr,
+                    "FATAL: server transport cannot bind %s: the path "
+                    "already exists (%s).\n"
+                    "  In server mode this process BINDS the sairedis "
+                    "endpoint. A live socket there means\n"
+                    "  syncd is serving ZMQ (syncd -z) or another sairedis "
+                    "process owns it; in that case run as\n"
+                    "  a client instead (drop --server, client is the "
+                    "default) so the request reaches the\n"
+                    "  server that is already listening. If no syncd -z is "
+                    "running, the file is stale -- remove\n"
+                    "  it or move the endpoint with --server-config <file>. "
+                    "A context config can relocate the\n"
+                    "  endpoints too (SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC); "
+                    "then pass --context-config.\n"
                     "  Set SAI_CAP_ZMQ_PRECHECK=0 to bypass this "
                     "preflight.\n",
-                    endpoint);
+                    kDefaultServerEndpoints.main,
+                    endpoint_state_text(main_state));
                 return 1;
+            }
+
+            if (options.debug) {
+                std::fprintf(
+                    stderr,
+                    "debug: server endpoints: main=%s (bind), ntf=%s "
+                    "(connect)\n",
+                    kDefaultServerEndpoints.main,
+                    kDefaultServerEndpoints.ntf);
             }
         }
     }
@@ -4154,7 +4394,8 @@ main(int argc, char **argv)
                 "  syncd serving ZMQ?      ps -o args= -C syncd   (look for "
                 "-z; without it a sairedis CLIENT cannot work, use --server "
                 "or SAI_CAP_ENABLE_CLIENT=false)\n"
-                "  client endpoints?       ls -l /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
+                "  client endpoints?       ls -l /tmp/saiServer "
+                "/tmp/saiServerNtf /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
                 oid_text);
             if (options.debug) {
                 std::fprintf(
