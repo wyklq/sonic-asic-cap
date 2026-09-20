@@ -697,65 +697,103 @@ main(int argc, char **argv)
     }
 
     /*
-     * 23. Server mode has the opposite contract: it BINDS the endpoint, so
-     *     a live socket there (syncd -z or another sairedis process) must
-     *     fail fast instead of surfacing as EADDRINUSE deep inside
-     *     sai_api_initialize. Bind a throwaway listener to make that
-     *     state real, then drop it again.
+     * 23. Server mode BINDS the endpoint, and libzmq unlinks whatever file
+     *     sits there before binding (ipc_listener_t::set_local_address), so
+     *     a leftover socket never blocks the run. What the preflight must
+     *     do instead is say who loses the endpoint: a live sairedis server
+     *     becomes unreachable, a stale file is just garbage. Both states
+     *     are created for real here, then removed again.
      */
     {
         struct stat endpoint_stat{};
         if (stat("/tmp/saiServer", &endpoint_stat) != 0) {
-            const int holder = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (holder >= 0) {
+            /* (a) stale: bound once, then closed without unlinking -- the
+             *     state a killed sairedis process leaves behind. */
+            const int stale_holder = socket(AF_UNIX, SOCK_STREAM, 0);
+
+            if (stale_holder >= 0) {
                 sockaddr_un address{};
                 address.sun_family = AF_UNIX;
                 std::snprintf(
                     address.sun_path, sizeof(address.sun_path), "/tmp/saiServer");
-                const bool bound =
-                    bind(holder, reinterpret_cast<sockaddr *>(&address),
+                const bool stale_bound =
+                    bind(stale_holder, reinterpret_cast<sockaddr *>(&address),
                          sizeof(address)) == 0;
-                if (bound) {
+                close(stale_holder);
+
+                if (stale_bound) {
                     const std::string out =
                         run_full("--server 0x21000000000000");
                     expect_contains(
                         out,
-                        "FATAL: server transport cannot bind /tmp/saiServer",
-                        "endpoint already bound fails fast");
+                        "WARNING: server mode will bind /tmp/saiServer, which "
+                        "already exists as socket",
+                        "stale endpoint is reported, not fatal");
                     expect_contains(
                         out,
-                        "syncd -z",
-                        "the zmq-server owner is named");
+                        "libzmq unlinks it before binding",
+                        "the reason the run continues is explained");
                     expect_contains(
-                        out,
-                        "[exit=1]",
-                        "server preflight failure exits 1");
-                    expect_not_contains(
                         out,
                         "=== Switch VID description ===",
-                        "server preflight failure runs no queries");
-                }
-                close(holder);
-                if (bound) {
-                    /* Only remove the socket this test created itself. */
+                        "stale endpoint does not stop the report");
+                    expect_contains(
+                        out,
+                        "[exit=0]",
+                        "stale endpoint still exits 0");
                     unlink("/tmp/saiServer");
                 }
-
-                const std::string suppressed =
-                    run("--server 0x21000000000000");
-                expect_contains(
-                    suppressed,
-                    "=== Switch VID description ===",
-                    "SAI_CAP_ZMQ_PRECHECK=0 bypasses the server preflight");
-                expect_contains(
-                    suppressed,
-                    "[exit=0]",
-                    "bypassed server preflight still queries normally");
-            } else {
-                std::fprintf(
-                    stderr,
-                    "cannot create probe socket: skipping case 23\n");
             }
+
+            /* (b) live: bound and listening, the way syncd -z holds it. */
+            const int live_holder = socket(AF_UNIX, SOCK_STREAM, 0);
+
+            if (live_holder >= 0) {
+                sockaddr_un address{};
+                address.sun_family = AF_UNIX;
+                std::snprintf(
+                    address.sun_path, sizeof(address.sun_path), "/tmp/saiServer");
+                const bool live_bound =
+                    bind(live_holder, reinterpret_cast<sockaddr *>(&address),
+                         sizeof(address)) == 0;
+
+                if (live_bound && listen(live_holder, 4) == 0) {
+                    const std::string out =
+                        run_full("--server 0x21000000000000");
+                    expect_contains(
+                        out,
+                        "WARNING: server mode is about to bind "
+                        "/tmp/saiServer, but a sairedis server is already "
+                        "listening there",
+                        "live endpoint owner is reported");
+                    expect_contains(
+                        out,
+                        "drop --server",
+                        "the client-mode alternative is suggested");
+                    expect_contains(
+                        out,
+                        "=== Switch VID description ===",
+                        "live endpoint does not stop the report either");
+                    expect_contains(
+                        out,
+                        "[exit=0]",
+                        "live endpoint still exits 0");
+                }
+
+                close(live_holder);
+                unlink("/tmp/saiServer");
+            }
+
+            const std::string suppressed =
+                run("--server 0x21000000000000");
+            expect_contains(
+                suppressed,
+                "=== Switch VID description ===",
+                "SAI_CAP_ZMQ_PRECHECK=0 bypasses the server preflight");
+            expect_contains(
+                suppressed,
+                "[exit=0]",
+                "bypassed server preflight still queries normally");
         } else {
             std::printf(
                 "skip server preflight case (/tmp/saiServer exists on this "

@@ -111,15 +111,21 @@ with those builds and refuses to report with the client default.
     `ipc:///tmp/zmq_ep` + `ipc:///tmp/zmq_ntf_ep` (the
     `SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC` defaults). A missing — or
     present-but-stale — endpoint exits 1 immediately with the fixes (run
-    `syncd -z`, use the Redis channel via `SAI_CAP_ENABLE_CLIENT=false` /
-    `--server`, or point elsewhere with `--client-config`) instead of
-    hanging until the 60 s response timeout.
+    `syncd -z zmq_sync`, use the Redis channel via
+    `SAI_CAP_ENABLE_CLIENT=false` / `--server`, or point elsewhere with
+    `--client-config`) instead of hanging until the 60 s response
+    timeout.
   * server mode (no `--server-config` / `--context-config`) BINDS the
-    endpoint, so nothing is wrong with a missing one — that is the normal
-    Redis-channel path. An endpoint that already exists means `syncd -z`
-    (or another sairedis process) owns it and `zmq_bind` would fail with
-    `EADDRINUSE`; the preflight reports that and points back at client
-    mode instead.
+    endpoint, so a missing one is the normal Redis-channel path. A file
+    that already exists there does **not** stop the run: libzmq's ipc
+    listener unlinks the path before `bind(2)`, so the socket file left
+    behind by a process that died without cleanup (an earlier `syncd -z`,
+    or an earlier run of this tool) simply disappears. The preflight only
+    emits a WARNING naming who owned it. The case that does matter is an
+    endpoint something is *still listening on* — a live `syncd -z` server,
+    for instance, whose endpoint this run would silently steal; the
+    warning then names the owning pid and points back at client mode
+    (or `rm -f` on both endpoints if that server is already gone).
   * `SAI_CAP_ZMQ_PRECHECK=0` skips the preflight to observe the raw
     wait-and-fail behaviour.
 * Exit code 3 (the switch VID did not validate) now prints the on-switch
@@ -155,9 +161,14 @@ network namespace. Options, in order of preference:
    nothing about the real endpoints.
 
 Note that client mode additionally requires `syncd` to run in synchronous
-ZMQ mode (`syncd -z`) at all — a stock async `syncd` exposes no sairedis
-server, in any namespace, and the Redis-channel path (`--server`) is the
-one that matches a normally running switch.
+ZMQ mode at all — watch the flag: **`-s` is only the deprecated alias for
+`redis_sync`**, which exposes no ZMQ endpoint; the real switch is
+`syncd -z zmq_sync`. A stock `syncd` (async, or `-s` redis_sync) exposes
+no sairedis server, in any namespace, and the Redis-channel path
+(`--server`) is the one that matches a normally running switch. A bare
+`/tmp/saiServer` socket file with nothing listening is therefore not
+evidence of a ZMQ server — it is a leftover from a process that died
+without cleanup (possibly an earlier run of this tool).
 
 ## Machine-readable output
 
