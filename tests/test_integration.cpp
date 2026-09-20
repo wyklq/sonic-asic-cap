@@ -205,6 +205,40 @@ main(int argc, char **argv)
             "switch type is read back");
     }
 
+    /*
+     * 2b. The switch VID is optional: with none given the tool must fall
+     *     back to the single-ASIC default and say so in the banner.
+     */
+    {
+        const std::string out = run("--object PORT");
+        expect_contains(
+            out, "Switch VID: 0x21000000000000 (default)",
+            "missing VID falls back to the default");
+        expect_contains(
+            out, "Switch VID validation: OK",
+            "default VID validates");
+        expect_not_contains(
+            out, "Invalid switch VID",
+            "missing VID is not a usage error");
+        expect_contains(
+            out, "[exit=0]",
+            "missing VID still produces a report");
+    }
+
+    /* 2c. An explicit VID overrides the default and is not marked. */
+    {
+        const std::string out = run("--object PORT 0x21000000000001");
+        expect_contains(
+            out, "Switch VID: 0x21000000000001\n",
+            "explicit VID is used verbatim");
+        expect_not_contains(
+            out, "(default)",
+            "explicit VID is not marked as the default");
+        expect_contains(
+            out, "Switch VID validation: OK",
+            "explicit override VID validates");
+    }
+
     /* 3. Vendor range status must collapse into one normalized bucket. */
     {
         const std::string out = run("--all 0x21000000000000");

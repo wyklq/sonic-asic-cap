@@ -33,7 +33,12 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 ## Usage
 
 ```sh
-# Dump capabilities over the Redis channel (the default transport)
+# Dump capabilities over the Redis channel (the default transport).
+# The switch VID is optional: on a single-ASIC SONiC box every switch
+# exposes the same oid, so the default 0x21000000000000 is used.
+./sai_cap_query
+
+# Same thing with the VID spelled out
 ./sai_cap_query 0x21000000000000
 
 # Only object types matching PORT, including rejected queries
@@ -55,6 +60,18 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 ./sai_cap_query --debug 0x21000000000000
 SAI_CAP_ENABLE_CLIENT=unset ./sai_cap_query --debug 0x21000000000000
 ```
+
+### The switch VID is optional (single-ASIC default)
+
+Every single-ASIC SONiC box exposes the same switch object oid, so the
+positional VID defaults to `0x21000000000000` (verified against ASIC_DB:
+`redis-cli -n 1 --scan --pattern 'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*'`
+answers exactly that key). A run without a VID targets it and the banner
+says `Switch VID: 0x21000000000000 (default)`.
+
+Pass an explicit VID on multi-ASIC (VoQ) boxes, where every asic has its
+own. If the default VID does not validate there, the exit-3 message says
+the built-in default was used and asks for the real VID.
 
 ### Exit codes
 
@@ -288,7 +305,10 @@ version addresses the highest-risk problems:
    sairedis query fail with `INVALID_OBJECT_ID`; the old tool then printed a
    full report that read as "the ASIC supports nothing". The VID is now
    validated against the live switch before any capability query, and the tool
-   exits with code 3 if it does not validate.
+   exits with code 3 if it does not validate. The VID itself is optional:
+   single-ASIC boxes all expose the same switch oid, so the tool defaults to it
+   instead of demanding the 16-digit value on every invocation (see *The switch
+   VID is optional* above).
 
 4. **Skip vs. failure separation.** Attributes whose value types cannot be
    probed generically are counted as `skipped_by_tool`, never as adapter

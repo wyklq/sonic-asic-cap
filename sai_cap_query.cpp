@@ -13,6 +13,9 @@
  *     throws on malformed/unexpected responses;
  *   - the switch VID is validated against the live switch table before any
  *     capability query, so a bad VID can never be mistaken for "unsupported";
+ *     the VID itself is optional -- single-ASIC SONiC boxes all expose the
+ *     same switch oid (kDefaultSwitchVidText), so a bare invocation targets
+ *     it;
  *   - "tool skipped this" is reported separately from "adapter rejected it";
  *   - extension/range status codes are normalized for the summaries;
  *   - SAI_SWITCH_ATTR_SUPPORTED_OBJECT_TYPE_LIST drives a three-state verdict
@@ -125,6 +128,16 @@ enum class Transport
     Server, /* Redis channel via the embedded sairedis server (default) */
 };
 
+/*
+ * Default switch VID for single-ASIC SONiC boxes. Every single-ASIC switch
+ * exposes the same switch object oid, so the positional VID is optional:
+ * a bare invocation targets this one. Verified against ASIC_DB on a
+ * z9332f-12 -- `redis-cli -n 1 --scan --pattern
+ * 'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*'` answers exactly this key. Multi-ASIC
+ * (VoQ) boxes give every asic its own VID and must pass it explicitly.
+ */
+const char kDefaultSwitchVidText[] = "0x21000000000000";
+
 struct Options
 {
     bool all = false;
@@ -148,6 +161,9 @@ struct Options
     std::string context_config;
     std::string server_config;
     const char *switch_vid = nullptr;
+    /* True when switch_vid came from kDefaultSwitchVidText rather than the
+     * command line, so the banner and the failure path can say so. */
+    bool switch_vid_defaulted = false;
     uint64_t response_timeout_ms = 0; /* 0 = library default */
 };
 
@@ -3668,12 +3684,17 @@ print_usage(const char *program)
 {
     std::fprintf(
         stderr,
-        "Usage: %s [options] <switch-VID-hex>\n"
+        "Usage: %s [options] [switch-VID-hex]\n"
         "\n"
         "The tool talks to the running syncd over the Redis channel by\n"
         "default (the sairedis server role), which works against every\n"
         "syncd mode. On a box where syncd runs -z zmq_sync, pass --client\n"
         "to act as a sairedis ZMQ client instead.\n"
+        "\n"
+        "The switch VID is optional: on a single-ASIC SONiC box every switch\n"
+        "exposes the same oid, so the default 0x21000000000000 is used when\n"
+        "none is given. Pass an explicit VID on multi-ASIC (VoQ) boxes, where\n"
+        "every asic has its own.\n"
         "\n"
         "Options:\n"
         "  --all                     Scan every metadata-known object and attribute\n"
@@ -3694,10 +3715,12 @@ print_usage(const char *program)
         "  -h, --help                Show this help\n"
         "\n"
         "Examples:\n"
+        "  %s                          (default single-ASIC VID)\n"
         "  %s 0x21000000000000\n"
         "  %s --object PORT --include-unsupported 0x21000000000000\n"
         "  %s --all 0x21000000000000 > capabilities.txt\n"
         "  %s --probe-stats 0x21000000000000\n",
+        program,
         program,
         program,
         program,
@@ -3831,12 +3854,28 @@ parse_options(int argc, char **argv, Options &options)
         return true;
     }
 
-    return options.switch_vid != nullptr;
+    /*
+     * The switch VID is optional. On a single-ASIC SONiC box it is always
+     * kDefaultSwitchVidText (verified against ASIC_DB), so a bare invocation
+     * works and nobody has to type the 16-digit oid every time; an explicit
+     * VID on the command line overrides the default, which is what
+     * multi-ASIC (VoQ) boxes need, since every asic has its own.
+     */
+    if (options.switch_vid == nullptr) {
+        options.switch_vid = kDefaultSwitchVidText;
+        options.switch_vid_defaulted = true;
+    }
+
+    return true;
 }
 
 bool
 parse_switch_vid(const char *text, sai_object_id_t &switch_id)
 {
+    if (text == nullptr) {
+        return false;
+    }
+
     errno = 0;
     char *end = nullptr;
     const uint64_t parsed = std::strtoull(text, &end, 0);
@@ -4220,8 +4259,9 @@ main(int argc, char **argv)
     FILE *const banner = json_output ? stderr : stdout;
     std::fprintf(
         banner,
-        "Switch VID: 0x%" PRIx64 "\n",
-        static_cast<uint64_t>(requested_switch));
+        "Switch VID: 0x%" PRIx64 "%s\n",
+        static_cast<uint64_t>(requested_switch),
+        options.switch_vid_defaulted ? " (default)" : "");
     std::fprintf(
         banner,
         "Transport: %s\n",
@@ -4356,6 +4396,14 @@ main(int argc, char **argv)
                 "  client endpoints?       ls -l /tmp/saiServer "
                 "/tmp/saiServerNtf /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
                 oid_text);
+            if (options.switch_vid_defaulted) {
+                std::fprintf(
+                    stderr,
+                    "NOTE: this run used the built-in default single-ASIC "
+                    "VID 0x21000000000000;\n"
+                    "      on a multi-ASIC (VoQ) box pass the real switch "
+                    "VID explicitly.\n");
+            }
             if (options.debug) {
                 std::fprintf(
                     stderr,
