@@ -122,6 +122,9 @@ with those builds and refuses to report with the client default.
     mode instead.
   * `SAI_CAP_ZMQ_PRECHECK=0` skips the preflight to observe the raw
     wait-and-fail behaviour.
+* Exit code 3 (the switch VID did not validate) now prints the on-switch
+  triage commands: whether the object is in the ASIC view, whether syncd
+  serves ZMQ, and whether the client endpoints exist.
 
 ### Containers and namespaces (SONiC / docker)
 
@@ -155,9 +158,6 @@ Note that client mode additionally requires `syncd` to run in synchronous
 ZMQ mode (`syncd -z`) at all — a stock async `syncd` exposes no sairedis
 server, in any namespace, and the Redis-channel path (`--server`) is the
 one that matches a normally running switch.
-* Exit code 3 (the switch VID did not validate) now prints the on-switch
-  triage commands: whether the object is in the ASIC view, whether syncd
-  serves ZMQ, and whether the client endpoints exist.
 
 ## Machine-readable output
 
