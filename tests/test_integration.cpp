@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <sys/stat.h>
 
 namespace {
 
@@ -79,7 +80,34 @@ main(int argc, char **argv)
     std::printf("integration tests (fake SAI adapter)\n");
     std::printf("------------------------------------\n");
 
+    /*
+     * Every case below runs with the client-mode ZMQ endpoint preflight
+     * disabled: the fake adapter never binds /tmp/zmq_ep, so on a host
+     * without syncd the preflight would (correctly) fail every
+     * client-mode run before the tool logic under test is reached.
+     * Case 22 exercises the preflight itself with and without the
+     * override.
+     */
     auto run = [&](const std::string &args) {
+        const std::string command =
+            "SAI_CAP_ZMQ_PRECHECK=0 " + tool + " " + args + " 2>&1";
+        std::string output;
+        FILE *pipe = popen(command.c_str(), "r");
+        if (pipe == nullptr) {
+            return output;
+        }
+        char buffer[4096];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            output += buffer;
+        }
+        const int status = pclose(pipe);
+        output += "\n[exit=" + std::to_string(WEXITSTATUS(status)) + "]\n";
+        return output;
+    };
+
+    /* Run with no environment overrides at all, so the tool sees the
+     * production defaults (preflight enabled). */
+    auto run_full = [&](const std::string &args) {
         const std::string command = tool + " " + args + " 2>&1";
         std::string output;
         FILE *pipe = popen(command.c_str(), "r");
@@ -97,7 +125,8 @@ main(int argc, char **argv)
 
     /* Capture stdout only, so JSON purity can be asserted. */
     auto run_stdout_only = [&](const std::string &args) {
-        const std::string command = tool + " " + args + " 2>/dev/null";
+        const std::string command =
+            "SAI_CAP_ZMQ_PRECHECK=0 " + tool + " " + args + " 2>/dev/null";
         std::string output;
         FILE *pipe = popen(command.c_str(), "r");
         if (pipe == nullptr) {
@@ -113,7 +142,9 @@ main(int argc, char **argv)
 
     /* Run with one environment variable prefixed to the command. */
     auto run_env = [&](const std::string &env, const std::string &args) {
-        const std::string command = env + " " + tool + " " + args + " 2>&1";
+        const std::string command =
+            "SAI_CAP_ZMQ_PRECHECK=0 " + env + " " + tool + " " + args +
+            " 2>&1";
         std::string output;
         FILE *pipe = popen(command.c_str(), "r");
         if (pipe == nullptr) {
@@ -596,6 +627,60 @@ main(int argc, char **argv)
             bogus,
             "debug:   SAI_REDIS_ENABLE_CLIENT = true",
             "unknown override keeps the default answer");
+    }
+
+    /*
+     * 22. Client transport with no syncd to talk to must fail fast instead
+     *     of waiting out the 60s response timeout. The endpoints are
+     *     absent on every ordinary build host; on a host that runs
+     *     syncd -z they exist, so the positive assertions are skipped
+     *     there to keep the test honest. The kill switch must restore the
+     *     unfailed path either way.
+     */
+    {
+        struct stat endpoint_stat{};
+        if (stat("/tmp/zmq_ep", &endpoint_stat) != 0) {
+            const std::string out =
+                run_full("--list-switches 0x21000000000000");
+            expect_contains(
+                out,
+                "FATAL: client transport cannot reach syncd",
+                "missing ZMQ endpoint fails fast");
+            expect_contains(
+                out,
+                "ZMQ endpoint /tmp/zmq_ep does not exist",
+                "the missing endpoint is named");
+            expect_contains(
+                out,
+                "syncd -z",
+                "the synchronous-mode fix is suggested");
+            expect_contains(
+                out,
+                "SAI_CAP_ENABLE_CLIENT=false",
+                "the redis-channel fallback is suggested");
+            expect_contains(
+                out,
+                "[exit=1]",
+                "preflight failure exits 1");
+            expect_not_contains(
+                out,
+                "=== Switch VID description ===",
+                "preflight failure runs no queries");
+        } else {
+            std::printf(
+                "skip preflight positive case "
+                "(/tmp/zmq_ep exists on this host)\n");
+        }
+
+        const std::string suppressed = run("--list-switches 0x21000000000000");
+        expect_contains(
+            suppressed,
+            "=== Switch VID description ===",
+            "SAI_CAP_ZMQ_PRECHECK=0 bypasses the preflight");
+        expect_contains(
+            suppressed,
+            "[exit=0]",
+            "bypassed preflight still queries normally");
     }
 
     std::printf("------------------------------------\n");

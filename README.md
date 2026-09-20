@@ -61,7 +61,7 @@ SAI_CAP_ENABLE_CLIENT=unset ./sai_cap_query --debug 0x21000000000000
 | code | meaning |
 |------|---------|
 | 0 | report produced |
-| 1 | SAI initialization / query-setup failure |
+| 1 | SAI initialization / transport-setup failure (including the client-mode ZMQ endpoint preflight) |
 | 2 | bad command line |
 | 3 | switch VID did not validate (refused to run) |
 
@@ -81,7 +81,10 @@ the other path fails: a client against an async syncd fails with
 `SAI_STATUS_FAILURE` on the first real operation (and
 `sai_query_api_version` answers `SAI_STATUS_NOT_IMPLEMENTED`, a client-side
 stub), while a server-role lookup of a switch object absent from the ASIC view
-fails with `SAI_STATUS_ITEM_NOT_FOUND`.
+fails with `SAI_STATUS_ITEM_NOT_FOUND`. A client-mode run without
+`--client-config` now preflights the built-in ZMQ endpoints before
+initializing (see *Debugging the transport*), so the common mistake fails in
+milliseconds instead of after the 60 s response timeout.
 
 Builds before `--client` support existed answered **nothing** for
 `SAI_REDIS_ENABLE_CLIENT`, so libsairedis always applied its own default (the
@@ -99,6 +102,13 @@ with those builds and refuses to report with the client default.
   answer for one run; `unset` (also `none`/`absent`) answers `nullptr`,
   reproducing the pre-`--client` builds exactly. This is the bisect knob for
   "which role does this box actually serve".
+* Before `sai_api_initialize`, a client-mode run without `--client-config`
+  checks that the built-in ZMQ endpoints (`/tmp/zmq_ep`, `/tmp/zmq_ntf_ep`)
+  exist — they only exist when `syncd` runs with `-z`. A missing endpoint
+  exits 1 immediately with the two fixes (run `syncd -z`, or query through the
+  Redis channel with `SAI_CAP_ENABLE_CLIENT=false` / `--server`) instead of
+  hanging until the 60 s response timeout. `SAI_CAP_ZMQ_PRECHECK=0` skips the
+  preflight to observe the raw wait-and-fail behaviour.
 * Exit code 3 (the switch VID did not validate) now prints the on-switch
   triage commands: whether the object is in the ASIC view, whether syncd
   serves ZMQ, and whether the client endpoints exist.

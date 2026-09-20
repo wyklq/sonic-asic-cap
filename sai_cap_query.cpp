@@ -66,6 +66,14 @@ std::string sai_serialize_status(sai_status_t status);
 #include <set>
 #include <string>
 #include <vector>
+
+/*
+ * POSIX stat(), used by the client-mode ZMQ endpoint preflight. The tool
+ * targets Linux (where libsairedis and syncd run), so the POSIX header is
+ * fine here.
+ */
+#include <sys/stat.h>
+
 namespace {
 
 using namespace cap;
@@ -3511,6 +3519,27 @@ profile_state()
 }
 
 /*
+ * Diagnostic switches are enabled unless explicitly disabled with "0",
+ * so the zero-value case (variable unset) keeps the check on.
+ */
+bool
+env_switch_on(const char *name)
+{
+    const char *value = std::getenv(name);
+
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+/*
+ * ZMQ endpoints libsairedis connects to in client mode when no
+ * client_config.json is supplied. These are the built-in defaults the
+ * sairedis server side binds; they only exist when syncd runs in
+ * synchronous mode (syncd -z).
+ */
+constexpr const char *kDefaultClientChannelPath = "/tmp/zmq_ep";
+constexpr const char *kDefaultClientNtfChannelPath = "/tmp/zmq_ntf_ep";
+
+/*
  * Single source of truth for every SAI_REDIS_KEY_* answer this process
  * gives libsairedis. Both the profile callback libsairedis sees and the
  * --debug dump go through here, so what gets printed is exactly what the
@@ -3906,6 +3935,59 @@ main(int argc, char **argv)
                 "debug:   %s = %s\n",
                 key,
                 answer == nullptr ? "(nullptr)" : answer);
+        }
+    }
+
+    /*
+     * Client mode sends every request to the sairedis server embedded in
+     * syncd over ZMQ channels. Without --client-config those channels are
+     * the built-in defaults, which only exist when syncd runs in
+     * synchronous mode (syncd -z). Against an async syncd each request
+     * would sit unanswered until the 60s synchronous-response timeout and
+     * only then fail, so verify the endpoints first and fail in
+     * milliseconds with an actionable message instead.
+     *
+     * A supplied client_config.json relocates the channels, so the
+     * built-in defaults say nothing about it and the check is skipped.
+     * SAI_CAP_ZMQ_PRECHECK=0 restores the old wait-and-fail behaviour for
+     * diagnosis.
+     */
+    if (state->transport == Transport::Client &&
+        options.client_config.empty() &&
+        env_switch_on("SAI_CAP_ZMQ_PRECHECK")) {
+        const char *const endpoints[] = {
+            kDefaultClientChannelPath,
+            kDefaultClientNtfChannelPath,
+        };
+        for (const char *endpoint : endpoints) {
+            struct stat endpoint_stat{};
+            if (stat(endpoint, &endpoint_stat) != 0) {
+                std::fprintf(
+                    stderr,
+                    "FATAL: client transport cannot reach syncd: ZMQ "
+                    "endpoint %s does not exist.\n"
+                    "  In client mode every request goes to the sairedis "
+                    "server embedded in syncd\n"
+                    "  over ZMQ; those endpoints only exist when syncd runs "
+                    "in synchronous\n"
+                    "  mode (syncd -z). Without them each call waits out "
+                    "the 60s response\n"
+                    "  timeout before failing.\n"
+                    "  On the switch, either:\n"
+                    "    - run syncd in synchronous mode (syncd -z) so it "
+                    "serves this client,\n"
+                    "      or\n"
+                    "    - query through the Redis channel like the builds "
+                    "that predate --client:\n"
+                    "      SAI_CAP_ENABLE_CLIENT=false (equivalently "
+                    "--server), or\n"
+                    "    - point the client at another server with "
+                    "--client-config <file>.\n"
+                    "  Set SAI_CAP_ZMQ_PRECHECK=0 to bypass this "
+                    "preflight.\n",
+                    endpoint);
+                return 1;
+            }
         }
     }
 
