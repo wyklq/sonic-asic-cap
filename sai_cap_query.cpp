@@ -3586,7 +3586,7 @@ print_usage(const char *program)
         "  --allow-clear             Also probe READ_AND_CLEAR modes (mutates counters)\n"
         "  --verify-attributes       Real GET for every declared-gettable attribute\n"
         "  --format text|json        Output format (default text)\n"
-        "  --list-switches           Validate and describe the supplied switch VID\n"
+        "  --list-switches           Describe the supplied switch VID (text mode only)\n"
         "  --client                  Connect to running syncd (default)\n"
         "  --server                  Become a sairedis server (use only without syncd)\n"
         "  --client-config <file>    sairedis client_config.json\n"
@@ -3712,9 +3712,25 @@ parse_options(int argc, char **argv, Options &options)
         }
     }
 
+    /*
+     * --list-switches returns early from main with a one-line
+     * human-readable description and never reaches the JSON builder.
+     * Silently ignoring the combination would emit a JSON document that
+     * pretends to honor a flag it dropped; treat it as a usage error.
+     */
+    if (options.list_switches && options.format == "json") {
+        std::fprintf(
+            stderr,
+            "--list-switches cannot be combined with --format json: the "
+            "switch description is a human-readable line, not a JSON "
+            "document.\n");
+        return false;
+    }
+
     if (options.show_help) {
         return true;
     }
+
     return options.switch_vid != nullptr;
 }
 
@@ -3989,6 +4005,14 @@ main(int argc, char **argv)
                 "WARNING: --probe-stats and --verify-attributes produce "
                 "line-oriented output and are not included in --format json. "
                 "Run text mode for those.\n");
+        }
+        if (options.include_unsupported) {
+            std::fprintf(
+                stderr,
+                "WARNING: --include-unsupported does not filter the JSON "
+                "sweeps; every attribute of every scanned type is reported "
+                "with its status, and the flag is only echoed in the options "
+                "section. Run text mode for the filtered view.\n");
         }
         const std::string document = report.dump();
         std::fwrite(

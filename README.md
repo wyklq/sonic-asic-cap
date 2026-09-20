@@ -86,6 +86,14 @@ than a large document. `--probe-stats` and `--verify-attributes` are
 line-oriented and are reported (on stderr) as excluded from JSON mode rather
 than being silently omitted.
 
+Flag interactions with JSON mode:
+
+| combination | behavior |
+|-------------|----------|
+| `--list-switches --format json` | rejected as a usage error (exit 2): the switch description is a human-readable line, not a JSON document, and silently dropping the flag would produce a misleading document |
+| `--include-unsupported --format json` | accepted, but inert: that flag only filters the text report, while the JSON sweeps already report every attribute of every scanned type with its status. It is echoed in the options section and a note is printed on stderr |
+| `--probe-stats` / `--verify-attributes --format json` | accepted and ignored: their line-oriented output would corrupt the single-document-on-stdout contract, so a stderr warning says so |
+
 JSON mode follows the text report's cost model: without `--all` or
 `--object`, the object-type sweeps (`statistics_capabilities`,
 `resource_availability`) are restricted to the same focused type lists the

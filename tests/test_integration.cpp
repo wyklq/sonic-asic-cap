@@ -448,6 +448,60 @@ main(int argc, char **argv)
             "default attribute sweep is restricted to focused types");
     }
 
+    /*
+     * 19. JSON mode must reject combinations it cannot honor instead of
+     *     silently dropping them. --list-switches returns early from main
+     *     with a human-readable line and never builds a document, so the
+     *     combination is a usage error (exit 2). --include-unsupported only
+     *     filters the text report, so it stays accepted but is announced on
+     *     stderr rather than silently ignored.
+     */
+    {
+        const std::string rejected =
+            run("--list-switches --format json 0x21000000000000");
+        expect_contains(
+            rejected,
+            "--list-switches cannot be combined with --format json",
+            "list-switches plus json is rejected");
+        expect_contains(
+            rejected, "[exit=2]",
+            "list-switches plus json exits 2");
+        expect_not_contains(
+            rejected, "\"schema_version\"",
+            "rejected combination emits no JSON document");
+
+        const std::string text = run("--list-switches 0x21000000000000");
+        expect_contains(
+            text, "=== Switch VID description ===",
+            "list-switches still works in text mode");
+        expect_contains(
+            text, "supported_object_types=",
+            "switch description reports the type count");
+        expect_contains(
+            text, "[exit=0]",
+            "list-switches in text mode exits 0");
+
+        const std::string merged =
+            run("--format json --include-unsupported 0x21000000000000");
+        expect_contains(
+            merged,
+            "--include-unsupported does not filter the JSON sweeps",
+            "inert flag is reported on stderr");
+        expect_contains(
+            merged, "\"include_unsupported\": true",
+            "inert flag is still echoed in the document");
+
+        const std::string stdout_only =
+            run_stdout_only(
+                "--format json --include-unsupported 0x21000000000000");
+        expect_contains(
+            stdout_only, "\"schema_version\": 1",
+            "inert flag still yields a JSON document");
+        expect_not_contains(
+            stdout_only, "WARNING: --include-unsupported",
+            "warning stays on stderr, not in the document");
+    }
+
     std::printf("------------------------------------\n");
     std::printf("%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
