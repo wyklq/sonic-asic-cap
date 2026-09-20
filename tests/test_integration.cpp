@@ -85,11 +85,10 @@ main(int argc, char **argv)
 
     /*
      * Every case below runs with the ZMQ endpoint preflight disabled: the
-     * fake adapter never binds /tmp/saiServer, so on a host without
-     * syncd the preflight would (correctly) fail every client-mode run
-     * before the tool logic under test is reached. Cases 22 and 23
-     * exercise the preflight itself, both roles, with and without the
-     * override.
+     * fake adapter never binds /tmp/saiServer, and the endpoint state of
+     * the build host is not something these cases should depend on. Cases
+     * 22 and 23 exercise the preflight itself, both roles, with and
+     * without the override.
      */
     auto run = [&](const std::string &args) {
         const std::string command =
@@ -244,12 +243,18 @@ main(int argc, char **argv)
             "port object is scanned (in supported list)");
     }
 
-    /* 6. The client/server transport must be reported honestly. */
+    /* 6. The client/server transport must be reported honestly, and the
+     *    default must be the Redis-channel server role. */
     {
         const std::string out = run("0x21000000000000");
         expect_contains(
-            out, "Transport: client",
-            "defaults to client transport");
+            out, "Transport: server",
+            "defaults to the Redis-channel server transport");
+        const std::string opted_in = run("--client 0x21000000000000");
+        expect_contains(
+            opted_in,
+            "Transport: client",
+            "--client opts into the ZMQ client transport");
     }
 
     /* 7. --probe-stats must reach the fake port/queue/IPG counters. */
@@ -563,11 +568,11 @@ main(int argc, char **argv)
         const std::string merged = run("--debug 0x21000000000000");
         expect_contains(
             merged,
-            "debug: transport=client",
+            "debug: transport=server",
             "debug prints the default transport");
         expect_contains(
             merged,
-            "debug:   SAI_REDIS_ENABLE_CLIENT = true",
+            "debug:   SAI_REDIS_ENABLE_CLIENT = false",
             "debug prints the profile answer libsairedis receives");
         expect_contains(
             merged,
@@ -598,6 +603,16 @@ main(int argc, char **argv)
             server,
             "debug:   SAI_REDIS_ENABLE_CLIENT = false",
             "server mode answers false");
+
+        const std::string client = run("--debug --client 0x21000000000000");
+        expect_contains(
+            client,
+            "debug: transport=client",
+            "debug prints the opted-in client transport");
+        expect_contains(
+            client,
+            "debug:   SAI_REDIS_ENABLE_CLIENT = true",
+            "client mode answers true");
     }
 
     /*
@@ -628,15 +643,15 @@ main(int argc, char **argv)
                 "--debug 0x21000000000000");
         expect_contains(
             bogus,
-            "debug:   SAI_REDIS_ENABLE_CLIENT = true",
+            "debug:   SAI_REDIS_ENABLE_CLIENT = false",
             "unknown override keeps the default answer");
     }
 
     /*
-     * 22. Client transport with no syncd to talk to must fail fast instead
-     *     of waiting out the 60s response timeout. The endpoints are
-     *     absent on every ordinary build host; on a host that runs
-     *     syncd -z they exist, so the negative assertions are skipped
+     * 22. The opt-in client transport with no syncd to talk to must fail
+     *     fast instead of waiting out the 60s response timeout. The
+     *     endpoints are absent on every ordinary build host; on a host that
+     *     runs syncd -z they exist, so the negative assertions are skipped
      *     there to keep the test honest. The kill switch must restore the
      *     unfailed path either way.
      */
@@ -646,7 +661,7 @@ main(int argc, char **argv)
         if (stat("/tmp/saiServer", &saiserver) != 0 &&
             stat("/tmp/zmq_ep", &zmq_ep) != 0) {
             const std::string out =
-                run_full("--list-switches 0x21000000000000");
+                run_full("--client --list-switches 0x21000000000000");
             expect_contains(
                 out,
                 "FATAL: client transport cannot reach syncd",
@@ -665,7 +680,7 @@ main(int argc, char **argv)
                 "the zmq-sync default endpoint is also named");
             expect_contains(
                 out,
-                "syncd -z",
+                "syncd -z zmq_sync",
                 "the synchronous-mode fix is suggested");
             expect_contains(
                 out,
@@ -702,7 +717,10 @@ main(int argc, char **argv)
      *     a leftover socket never blocks the run. What the preflight must
      *     do instead is say who loses the endpoint: a live sairedis server
      *     becomes unreachable, a stale file is just garbage. Both states
-     *     are created for real here, then removed again.
+     *     are created for real here, then removed again. The invocations
+     *     below carry no transport flag on purpose: the server role is the
+     *     default, so this is exactly the z9332f-12 scenario (a default run
+     *     on a box with a leftover /tmp/saiServer).
      */
     {
         struct stat endpoint_stat{};
@@ -723,7 +741,7 @@ main(int argc, char **argv)
 
                 if (stale_bound) {
                     const std::string out =
-                        run_full("--server 0x21000000000000");
+                        run_full("--list-switches 0x21000000000000");
                     expect_contains(
                         out,
                         "WARNING: server mode will bind /tmp/saiServer, which "
@@ -759,7 +777,7 @@ main(int argc, char **argv)
 
                 if (live_bound && listen(live_holder, 4) == 0) {
                     const std::string out =
-                        run_full("--server 0x21000000000000");
+                        run_full("--list-switches 0x21000000000000");
                     expect_contains(
                         out,
                         "WARNING: server mode is about to bind "
@@ -768,7 +786,7 @@ main(int argc, char **argv)
                         "live endpoint owner is reported");
                     expect_contains(
                         out,
-                        "drop --server",
+                        "re-run with --client",
                         "the client-mode alternative is suggested");
                     expect_contains(
                         out,

@@ -5,8 +5,10 @@
  * over the regular SAI Redis / ZMQ transport.
  *
  * P0 changes (see README.md "P0 hardening"):
- *   - it runs as a sairedis CLIENT by default (SAI_REDIS_ENABLE_CLIENT=true),
- *     so it never binds the server endpoint that syncd already owns;
+ *   - the transport defaults to the Redis channel (the sairedis server
+ *     role, SAI_REDIS_ENABLE_CLIENT=false), which is what a stock syncd
+ *     serves; --client opts into the ZMQ client role, which additionally
+ *     needs syncd -z zmq_sync;
  *   - every libsairedis call is wrapped in try/catch, because libsairedis
  *     throws on malformed/unexpected responses;
  *   - the switch VID is validated against the live switch table before any
@@ -119,8 +121,8 @@ constexpr uint32_t kMaximumListCapacity = 1024 * 1024;
 
 enum class Transport
 {
-    Client, /* connect to the running server (default, safe) */
-    Server, /* become a sairedis server (only if no syncd runs) */
+    Client, /* connect to syncd's ZMQ server (--client; needs -z zmq_sync) */
+    Server, /* Redis channel via the embedded sairedis server (default) */
 };
 
 struct Options
@@ -130,7 +132,13 @@ struct Options
     bool probe_stats = false;
     bool show_help = false;
     bool list_switches = false;
-    bool server_mode = false;
+    /*
+     * Which transport role to take. The default is the server role (the
+     * Redis channel): a stock syncd serves no ZMQ endpoint at all, so the
+     * client role cannot work on a normal box, while the server role
+     * works against every syncd mode. --client opts into the client role.
+     */
+    bool client_mode = false;
     bool allow_clear = false;
     bool verify_attributes = false;
     bool debug = false;
@@ -2985,7 +2993,7 @@ probe_live_stats(
             switch_info,
             switch_id,
             cache.get(switch_info),
-            [switch_api, switch_id](
+            [switch_api](
                 sai_object_id_t object_id,
                 uint32_t count,
                 const sai_stat_id_t *ids,
@@ -3506,7 +3514,7 @@ build_json_report(
 
 struct ProfileState
 {
-    Transport transport = Transport::Client;
+    Transport transport = Transport::Server;
     Options options;
     bool initialized = false;
 };
@@ -3597,10 +3605,13 @@ redis_profile_answer(const ProfileState &state, const char *variable)
         }
 
         /*
-         * Default to CLIENT: acting as a server lets this tool bind the
-         * endpoint syncd already owns and shares the synchronous response
-         * queue with any other client, which is only acceptable when no
-         * syncd is running.
+         * Default to the Redis channel (server role). A stock syncd --
+         * async, or -s redis_sync -- serves no ZMQ endpoint at all, so
+         * the client role is dead on arrival on a normal box, while the
+         * server role works against every syncd mode. The client role
+         * stays opt-in (--client) for boxes running syncd -z zmq_sync,
+         * where connecting beats binding because the running syncd owns
+         * the endpoint.
          */
         return state.transport == Transport::Client ? "true" : "false";
     }
@@ -3659,8 +3670,10 @@ print_usage(const char *program)
         stderr,
         "Usage: %s [options] <switch-VID-hex>\n"
         "\n"
-        "The tool connects to the running syncd as a sairedis CLIENT by\n"
-        "default. Use --server only on a box where syncd is stopped.\n"
+        "The tool talks to the running syncd over the Redis channel by\n"
+        "default (the sairedis server role), which works against every\n"
+        "syncd mode. On a box where syncd runs -z zmq_sync, pass --client\n"
+        "to act as a sairedis ZMQ client instead.\n"
         "\n"
         "Options:\n"
         "  --all                     Scan every metadata-known object and attribute\n"
@@ -3671,8 +3684,8 @@ print_usage(const char *program)
         "  --verify-attributes       Real GET for every declared-gettable attribute\n"
         "  --format text|json        Output format (default text)\n"
         "  --list-switches           Describe the supplied switch VID (text mode only)\n"
-        "  --client                  Connect to running syncd (default)\n"
-        "  --server                  Become a sairedis server (use only without syncd)\n"
+        "  --client                  Act as a sairedis ZMQ client (needs syncd -z zmq_sync)\n"
+        "  --server                  Use the Redis channel (default)\n"
         "  --client-config <file>    sairedis client_config.json\n"
         "  --context-config <file>   sairedis context_config.json\n"
         "  --server-config <file>    sairedis server_config.json\n"
@@ -3744,9 +3757,9 @@ parse_options(int argc, char **argv, Options &options)
         } else if (argument == "--list-switches") {
             options.list_switches = true;
         } else if (argument == "--client") {
-            options.server_mode = false;
+            options.client_mode = true;
         } else if (argument == "--server") {
-            options.server_mode = true;
+            options.client_mode = false;
         } else if (argument == "--object") {
             if (!need_value(index, "--object", options.object_filter)) {
                 return false;
@@ -3906,7 +3919,7 @@ main(int argc, char **argv)
     ProfileState *state = profile_state();
     state->options = options;
     state->transport =
-        options.server_mode ? Transport::Server : Transport::Client;
+        options.client_mode ? Transport::Client : Transport::Server;
 
     /*
      * The provided VID is validated against the live switch object below. A
@@ -4024,11 +4037,11 @@ main(int argc, char **argv)
                         "it: a leftover from a sairedis\n"
                         "  process that died without cleanup -- a crashed "
                         "syncd -z, or an earlier run of this tool\n"
-                        "  (--server, or any client-mode run, binds these "
-                        "paths) that was killed. Nothing can\n"
-                        "  serve it now, so every request would still wait "
-                        "out the 60s timeout.\n"
-                        "  Remove it with: rm -f %s %s\n",
+                        "  (the default server role binds this path; client "
+                        "mode binds the ntf one) that was\n"
+                        "  killed. Nothing can serve it now, so every request "
+                        "would still wait out the 60s\n"
+                        "  timeout. Remove it with: rm -f %s %s\n",
                         stale_pair->main,
                         stale_pair->main,
                         stale_pair->ntf);
@@ -4039,8 +4052,8 @@ main(int argc, char **argv)
                     "    - syncd is not serving ZMQ at all: that is the "
                     "normal case (an async syncd\n"
                     "      exposes no ZMQ endpoint). Run it in synchronous "
-                    "mode (syncd -z) to serve\n"
-                    "      this client, or\n"
+                    "mode (syncd -z zmq_sync) to\n"
+                    "      serve this client, or\n"
                     "    - the endpoint exists but not HERE: ipc:// endpoints "
                     "are UNIX socket files\n"
                     "      living in the namespaces of the container that "
@@ -4052,10 +4065,11 @@ main(int argc, char **argv)
                     "      socket, or publish the endpoint out and point the "
                     "client at it with\n"
                     "      --client-config <file>, or\n"
-                    "    - drop client mode and use the Redis channel, which "
-                    "works against a normal\n"
-                    "      async syncd: --server (equivalently "
-                    "SAI_CAP_ENABLE_CLIENT=false).\n"
+                    "    - drop client mode (re-run without --client) and use "
+                    "the Redis channel, which\n"
+                    "      works against a normal async syncd -- it is the "
+                    "default (equivalently\n"
+                    "      SAI_CAP_ENABLE_CLIENT=false).\n"
                     "  Set SAI_CAP_ZMQ_PRECHECK=0 to bypass this "
                     "preflight.\n");
                 return 1;
@@ -4130,8 +4144,8 @@ main(int argc, char **argv)
                         "  libzmq unlinks the file and binds anyway, so this "
                         "run continues -- but the running server loses its\n"
                         "  endpoint and THIS process answers requests from "
-                        "then on. If that server is syncd -z, drop --server\n"
-                        "  and run as a client instead so the request "
+                        "then on. If that server is syncd -z zmq_sync,\n"
+                        "  re-run with --client instead so the request "
                         "reaches the server that is already listening.\n"
                         "  Move the endpoint with --server-config <file>, or "
                         "relocate it via --context-config\n"
@@ -4164,7 +4178,7 @@ main(int argc, char **argv)
                 std::fprintf(
                     stderr,
                     "debug: server endpoints: main=%s (bind), ntf=%s "
-                    "(connect)\n",
+                    "(bind)\n",
                     kDefaultServerEndpoints.main,
                     kDefaultServerEndpoints.ntf);
             }
@@ -4186,8 +4200,8 @@ main(int argc, char **argv)
             exception.what());
         std::fprintf(
             stderr,
-            "Hint: if syncd is running with ZMQ, ensure you did not pass "
-            "--server; this tool defaults to client mode.\n");
+            "Hint: if syncd is running with -z zmq_sync, pass --client; "
+            "this tool defaults to the Redis channel.\n");
         return 1;
     }
 
@@ -4213,13 +4227,7 @@ main(int argc, char **argv)
         "Transport: %s\n",
         state->transport == Transport::Client
             ? "client (connect to running syncd)"
-            : "server (this process owns the sairedis endpoint)");
-    if (state->transport == Transport::Server) {
-        std::fprintf(
-            banner,
-            "WARNING: server mode shares the synchronous response queue with "
-            "any other client and must not be used while syncd is running.\n");
-    }
+            : "server (Redis channel through this process)");
 
     std::fprintf(banner, "\n=== Version context ===\n");
     std::fprintf(
@@ -4333,10 +4341,12 @@ main(int argc, char **argv)
                 "ASIC_STATE_TABLE | grep %s\n"
                 "                          (ASIC_DB is database 1; -n 0 is "
                 "APPL_DB, where ASIC_STATE_TABLE does not exist)\n"
-                "  syncd serving ZMQ?      ps -o args= -C syncd   (a sairedis "
-                "CLIENT needs -z zmq_sync; -s alone is the deprecated\n"
-                "                          redis_sync alias and still leaves "
-                "client mode without a server -- use --server)\n"
+                "  syncd serving ZMQ?      ps -o args= -C syncd   (-z zmq_sync "
+                "is needed only by the opt-in client\n"
+                "                          role, --client; -s is the "
+                "deprecated redis_sync alias; the default Redis\n"
+                "                          channel works against any syncd "
+                "mode)\n"
                 "  client endpoints?       ls -l /tmp/saiServer "
                 "/tmp/saiServerNtf /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
                 oid_text);
@@ -4392,7 +4402,7 @@ main(int argc, char **argv)
                 banner,
                 "Sync timeout: NOT APPLIED (--timeout-ms=%" PRIu64 "). "
                 "libsairedis rejects extension attributes in client mode; "
-                "use the default 60s timeout or run with --server.\n",
+                "use the default 60s timeout or drop --client.\n",
                 options.response_timeout_ms);
         }
     }

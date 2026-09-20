@@ -33,7 +33,7 @@ checkout containing `meta/saimetadata.c`, `meta/saimetadatautils.c` and
 ## Usage
 
 ```sh
-# Connect to the running syncd (client mode) and dump capabilities
+# Dump capabilities over the Redis channel (the default transport)
 ./sai_cap_query 0x21000000000000
 
 # Only object types matching PORT, including rejected queries
@@ -72,12 +72,14 @@ profile answer:
 
 | role | profile answer | how operations are served |
 |------|----------------|---------------------------|
-| client | `SAI_REDIS_ENABLE_CLIENT=true` | requests go over the ZMQ channels (client_config.json or built-in defaults) to the sairedis server embedded in `syncd`; **requires syncd running with `-z`** (ZMQ synchronous mode) |
+| client | `SAI_REDIS_ENABLE_CLIENT=true` | requests go over the ZMQ channels (client_config.json or built-in defaults) to the sairedis server embedded in `syncd`; **requires syncd running with `-z zmq_sync`** (ZMQ synchronous mode; `-s` alone is the deprecated `redis_sync` alias and exposes no endpoint) |
 | server | anything else / key absent | libsairedis's default role: operations are served through the Redis channel; this is the role dozens of SONiC diagnostics used for years, and it works against a normally running (async mode) syncd |
 
-The tool answers `true` by default (`--client`, the default) and `false` with
-`--server`. If an environment only serves one of the two paths, every call on
-the other path fails: a client against an async syncd fails with
+The tool answers `false` by default — the server role, i.e. the Redis channel,
+which works against a normally running syncd in any mode. `--client` opts into
+the client role (`true`), for boxes where syncd runs `-z zmq_sync`; `--server`
+restates the default. If an environment only serves one of the two paths, every
+call on the other path fails: a client against an async syncd fails with
 `SAI_STATUS_FAILURE` on the first real operation (and
 `sai_query_api_version` answers `SAI_STATUS_NOT_IMPLEMENTED`, a client-side
 stub), while a server-role lookup of a switch object absent from the ASIC view
@@ -86,10 +88,13 @@ fails with `SAI_STATUS_ITEM_NOT_FOUND`. A client-mode run without
 initializing (see *Debugging the transport*), so the common mistake fails in
 milliseconds instead of after the 60 s response timeout.
 
-Builds before `--client` support existed answered **nothing** for
-`SAI_REDIS_ENABLE_CLIENT`, so libsairedis always applied its own default (the
-server role above). A box that only serves the Redis channel therefore worked
-with those builds and refuses to report with the client default.
+The client default introduced with `--client` support was a regression: a stock
+syncd (async, or `-s` redis_sync) serves no ZMQ endpoint at all, so the client
+role is dead on arrival on a normal box, while the server role works against
+every syncd mode. Builds before `--client` support existed answered **nothing**
+for `SAI_REDIS_ENABLE_CLIENT`, so libsairedis always applied its own default —
+the server role — which is why those builds worked on such boxes. The default
+is the server role again, and the client role is the opt-in.
 
 ### Debugging the transport
 
@@ -111,10 +116,10 @@ with those builds and refuses to report with the client default.
     `ipc:///tmp/zmq_ep` + `ipc:///tmp/zmq_ntf_ep` (the
     `SAI_REDIS_COMMUNICATION_MODE_ZMQ_SYNC` defaults). A missing — or
     present-but-stale — endpoint exits 1 immediately with the fixes (run
-    `syncd -z zmq_sync`, use the Redis channel via
-    `SAI_CAP_ENABLE_CLIENT=false` / `--server`, or point elsewhere with
-    `--client-config`) instead of hanging until the 60 s response
-    timeout.
+    `syncd -z zmq_sync`, use the Redis channel — the default, so just
+    drop `--client`; equivalently `SAI_CAP_ENABLE_CLIENT=false` /
+    `--server` — or point elsewhere with `--client-config`) instead of
+    hanging until the 60 s response timeout.
   * server mode (no `--server-config` / `--context-config`) BINDS the
     endpoint, so a missing one is the normal Redis-channel path. A file
     that already exists there does **not** stop the run: libzmq's ipc
@@ -164,8 +169,8 @@ Note that client mode additionally requires `syncd` to run in synchronous
 ZMQ mode at all — watch the flag: **`-s` is only the deprecated alias for
 `redis_sync`**, which exposes no ZMQ endpoint; the real switch is
 `syncd -z zmq_sync`. A stock `syncd` (async, or `-s` redis_sync) exposes
-no sairedis server, in any namespace, and the Redis-channel path
-(`--server`) is the one that matches a normally running switch. A bare
+no sairedis server, in any namespace, and the Redis-channel path (the
+default) is the one that matches a normally running switch. A bare
 `/tmp/saiServer` socket file with nothing listening is therefore not
 evidence of a ZMQ server — it is a leftover from a process that died
 without cleanup (possibly an earlier run of this tool).
@@ -266,11 +271,15 @@ were an ASIC capability.
 Earlier revisions could produce convincing but wrong reports. The current
 version addresses the highest-risk problems:
 
-1. **Client mode by default.** libsairedis decides client vs. server from the
-   `SAI_REDIS_ENABLE_CLIENT` profile key. The old tool always returned
-   `nullptr`, so it became a *server* and tried to `zmq_bind` the endpoint
-   `syncd` already owned — which throws. `--server` now opts in explicitly and
-   is only appropriate when `syncd` is stopped.
+1. **An explicit transport role, defaulting to the Redis channel.**
+   libsairedis decides client vs. server from the `SAI_REDIS_ENABLE_CLIENT`
+   profile key. The tool now answers it deliberately: `false` by default (the
+   server role, which works against a syncd in any mode), `true` with
+   `--client` for boxes running `syncd -z zmq_sync`, overridable per run with
+   `SAI_CAP_ENABLE_CLIENT=true|false|unset`. Answering it wrongly fails every
+   call, so the built-in ZMQ endpoints are preflighted before initialization
+   and the wrong-role mistake is reported in milliseconds with the fix (see
+   *Debugging the transport*).
 
 2. **No unhandled exceptions.** libsairedis throws on malformed or unexpected
    responses. Every SAI call is now wrapped in `try`/`catch`.
