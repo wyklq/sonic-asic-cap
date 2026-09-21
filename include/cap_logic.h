@@ -222,6 +222,64 @@ summary_bucket(FetchKind kind, sai_status_t status)
 }
 
 /*
+ * Verdict for the single live GET that probes the requested switch VID
+ * before any capability query runs.
+ *
+ * The probe exists so a wrong VID cannot turn the whole report into a page
+ * of false negatives, but the same GET fails for two very different
+ * reasons and only one of them says anything about the VID:
+ *
+ *   InvalidOid      SAI_STATUS_INVALID_OBJECT_ID: the oid is not a valid
+ *                   switch object at all (wrong object type, or an asic
+ *                   outside this context). Every capability query fails
+ *                   the same way, so the report would be pure false
+ *                   negatives and refusing to run is correct.
+ *   Environmental   anything else, SAI_STATUS_ITEM_NOT_FOUND above all:
+ *                   the object is absent from the ASIC view this process
+ *                   reaches. A correct single-ASIC VID hits this whenever
+ *                   the view does not carry the switch yet (syncd -u
+ *                   leaves objects in TEMP_ASIC_STATE until APPLY_VIEW),
+ *                   while the adapter itself still answers the capability
+ *                   queries. Refusing here would throw away a good report
+ *                   over an environmental artifact, so the run continues
+ *                   with a warning.
+ */
+enum class SwitchProbeVerdict
+{
+    Ok,
+    InvalidOid,
+    Environmental,
+};
+
+inline SwitchProbeVerdict
+classify_switch_probe(sai_status_t status)
+{
+    if (status == SAI_STATUS_SUCCESS) {
+        return SwitchProbeVerdict::Ok;
+    }
+
+    if (status == SAI_STATUS_INVALID_OBJECT_ID) {
+        return SwitchProbeVerdict::InvalidOid;
+    }
+
+    return SwitchProbeVerdict::Environmental;
+}
+
+inline const char *
+switch_probe_verdict_name(SwitchProbeVerdict verdict)
+{
+    switch (verdict) {
+        case SwitchProbeVerdict::Ok:
+            return "OK";
+        case SwitchProbeVerdict::InvalidOid:
+            return "INVALID_OID";
+        case SwitchProbeVerdict::Environmental:
+            return "ENVIRONMENTAL";
+    }
+    return "UNKNOWN";
+}
+
+/*
  * Coarse classification for enum values that are absent from the locally
  * generated metadata (for example values added by a newer vendor SAI).
  */

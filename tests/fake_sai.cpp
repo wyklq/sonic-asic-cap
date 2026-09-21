@@ -28,6 +28,16 @@ constexpr sai_object_id_t kGoodSwitch = 0x21000000000000ULL;
  * test exercise the "condition evaluated as met" path.
  */
 constexpr sai_object_id_t kPhySwitch = 0x21000000000001ULL;
+/*
+ * A structurally valid switch oid that is absent from the ASIC view: every
+ * get_switch_attribute answers SAI_STATUS_ITEM_NOT_FOUND, while the
+ * capability queries still succeed. This mirrors a real box where the
+ * switch object is not (yet) in the view the tool reaches -- syncd -u
+ * leaves objects in TEMP_ASIC_STATE until APPLY_VIEW -- and it is exactly
+ * the shape that used to make the tool exit 3 on the correct fixed
+ * single-ASIC VID.
+ */
+constexpr sai_object_id_t kViewlessSwitch = 0x21000000000002ULL;
 constexpr sai_object_id_t kPortA = 0x10000000000001ULL;
 constexpr sai_object_id_t kQueueA = 0x15000000000001ULL;
 constexpr sai_object_id_t kIpgA = 0x1a000000000001ULL;
@@ -38,6 +48,9 @@ fake_get_switch_attribute(
     uint32_t attr_count,
     sai_attribute_t *attr_list)
 {
+    if (switch_id == kViewlessSwitch) {
+        return SAI_STATUS_ITEM_NOT_FOUND;
+    }
     if (switch_id != kGoodSwitch && switch_id != kPhySwitch) {
         return SAI_STATUS_INVALID_OBJECT_ID;
     }
@@ -341,9 +354,13 @@ sai_query_attribute_capability(
     /*
      * Mirror libsairedis, which requires a valid SWITCH oid here and rejects
      * anything else. Validating this in the fake catches callers that pass an
-     * object id instead of the switch id.
+     * object id instead of the switch id. The view-absent switch is accepted
+     * on purpose: capability queries are answered by the adapter itself, not
+     * from the ASIC view, so a switch missing from the view must still get
+     * real capability answers.
      */
-    if (switch_id != kGoodSwitch && switch_id != kPhySwitch) {
+    if (switch_id != kGoodSwitch && switch_id != kPhySwitch &&
+        switch_id != kViewlessSwitch) {
         return SAI_STATUS_INVALID_OBJECT_ID;
     }
     if (capability == nullptr) {

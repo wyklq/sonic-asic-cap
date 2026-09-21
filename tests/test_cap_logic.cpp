@@ -626,6 +626,64 @@ test_combine_condition_states()
         "two unevaluated predicates stay unknown");
 }
 
+/*
+ * The switch-VID probe must only refuse the run for a structurally invalid
+ * oid. SAI_STATUS_ITEM_NOT_FOUND and friends mean the object is absent
+ * from the ASIC view the process reaches, which a correct single-ASIC VID
+ * hits on a box whose view is not APPLYed yet; those runs must continue.
+ */
+void
+test_switch_probe_verdict()
+{
+    using cap::classify_switch_probe;
+    using cap::SwitchProbeVerdict;
+    using cap::switch_probe_verdict_name;
+
+    auto name = [](SwitchProbeVerdict verdict) {
+        return std::string(switch_probe_verdict_name(verdict));
+    };
+
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_SUCCESS)),
+        "OK",
+        "a good VID probe is OK");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_INVALID_OBJECT_ID)),
+        "INVALID_OID",
+        "a structurally invalid oid refuses the run");
+
+    /*
+     * The regression this encodes: on a real box the fixed single-ASIC VID
+     * 0x21000000000000 answers the probe GET with ITEM_NOT_FOUND when the
+     * ASIC view does not carry the switch, while the capability queries
+     * still work. That used to be a fatal exit-3.
+     */
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_ITEM_NOT_FOUND)),
+        "ENVIRONMENTAL",
+        "ITEM_NOT_FOUND is environmental, not fatal");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_FAILURE)),
+        "ENVIRONMENTAL",
+        "a transport failure is environmental, not fatal");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_NOT_IMPLEMENTED)),
+        "ENVIRONMENTAL",
+        "NOT_IMPLEMENTED is environmental, not fatal");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_NOT_SUPPORTED)),
+        "ENVIRONMENTAL",
+        "NOT_SUPPORTED is environmental, not fatal");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_INVALID_PARAMETER)),
+        "ENVIRONMENTAL",
+        "INVALID_PARAMETER is environmental, not fatal");
+    expect_eq(
+        name(classify_switch_probe(SAI_STATUS_BUFFER_OVERFLOW)),
+        "ENVIRONMENTAL",
+        "BUFFER_OVERFLOW is environmental, not fatal");
+}
+
 } // namespace
 
 int
@@ -648,6 +706,7 @@ main()
     test_condition_evaluability();
     test_condition_aware_agreement();
     test_combine_condition_states();
+    test_switch_probe_verdict();
 
     std::printf("--------------------\n");
     std::printf(

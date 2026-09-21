@@ -11,11 +11,15 @@
  *     needs syncd -z zmq_sync;
  *   - every libsairedis call is wrapped in try/catch, because libsairedis
  *     throws on malformed/unexpected responses;
- *   - the switch VID is validated against the live switch table before any
- *     capability query, so a bad VID can never be mistaken for "unsupported";
- *     the VID itself is optional -- single-ASIC SONiC boxes all expose the
- *     same switch oid (kDefaultSwitchVidText), so a bare invocation targets
- *     it;
+ *   - the switch VID is probed with one live GET before any capability
+ *     query: a structurally invalid oid (SAI_STATUS_INVALID_OBJECT_ID)
+ *     refuses the run, because every answer would be a false negative,
+ *     while an object merely absent from the ASIC view
+ *     (SAI_STATUS_ITEM_NOT_FOUND) only warns -- a correct single-ASIC VID
+ *     answers that way on a box whose view does not carry the switch yet,
+ *     and the capability queries still work; the VID itself is optional --
+ *     single-ASIC SONiC boxes all expose the same switch oid
+ *     (kDefaultSwitchVidText), so a bare invocation targets it;
  *   - "tool skipped this" is reported separately from "adapter rejected it";
  *   - extension/range status codes are normalized for the summaries;
  *   - SAI_SWITCH_ATTR_SUPPORTED_OBJECT_TYPE_LIST drives a three-state verdict
@@ -4326,9 +4330,13 @@ main(int argc, char **argv)
     const auto *switch_api = static_cast<const sai_switch_api_t *>(api_table);
 
     /*
-     * Validate the switch VID before running any capability query. This is the
-     * guard that keeps a wrong/expired VID from turning the whole report into
-     * "unsupported".
+     * Probe the switch VID with one live GET before running any capability
+     * query. The probe is a diagnostic, not a gate: see
+     * cap::classify_switch_probe for why only SAI_STATUS_INVALID_OBJECT_ID
+     * refuses the run. A structurally invalid oid makes every capability
+     * query fail the same way, so the report would be a page of false
+     * negatives; an object merely absent from the ASIC view does not,
+     * because the adapter answers the capability queries itself.
      */
     {
         const sai_attr_metadata_t *type_metadata =
@@ -4344,85 +4352,152 @@ main(int argc, char **argv)
         sai_attribute_t attribute{};
         attribute.id = type_metadata->attrid;
         status = SAI_STATUS_FAILURE;
+        std::string probe_exception;
         try {
             DebugTimer timer("switch VID validation GET", options.debug);
             status = switch_api->get_switch_attribute(
                 requested_switch, 1, &attribute);
         } catch (const std::exception &exception) {
-            std::fprintf(
-                stderr,
-                "Switch VID validation threw: %s\n",
-                exception.what());
-            sai_api_uninitialize();
-            return 1;
+            /*
+             * libsairedis throws on malformed/unexpected responses. That
+             * says the transport misbehaved, not that the VID is wrong,
+             * so it must not abort the report either.
+             */
+            probe_exception = exception.what();
         }
 
-        if (status != SAI_STATUS_SUCCESS) {
-            char oid_text[32];
-            std::snprintf(
-                oid_text,
-                sizeof(oid_text),
-                "0x%" PRIx64,
-                static_cast<uint64_t>(requested_switch));
-            std::fprintf(
-                stderr,
-                "\nFATAL: switch VID %s is not a valid live "
-                "switch: %s\n"
-                "Refusing to run capability queries, because every answer "
-                "would be a false negative.\n"
-                "Check the VID against ASIC_DB / syncd, and make sure the "
-                "context config matches.\n",
-                oid_text,
-                format_status(status).c_str());
-            std::fprintf(
-                stderr,
-                "Triage on the switch:\n"
-                "  is the VID in the view? redis-cli -n 1 HGETALL "
-                "\"ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:oid:%s\"\n"
-                "                          (ASIC_DB is database 1; view "
-                "entries are per-object\n"
-                "                           hashes under ASIC_STATE:; with "
-                "syncd -u they may sit in\n"
-                "                           TEMP_ASIC_STATE: until "
-                "APPLY_VIEW)\n"
-                "  which switches exist?  redis-cli -n 1 --scan --pattern "
-                "'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*'\n"
-                "  syncd serving ZMQ?      ps -o args= -C syncd   (-z zmq_sync "
-                "is needed only by the opt-in client\n"
-                "                          role, --client; -s is the "
-                "deprecated redis_sync alias; the default Redis\n"
-                "                          channel works against any syncd "
-                "mode)\n"
-                "  client endpoints?       ls -l /tmp/saiServer "
-                "/tmp/saiServerNtf /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
-                oid_text);
-            if (options.switch_vid_defaulted) {
-                std::fprintf(
-                    stderr,
-                    "NOTE: this run used the built-in default single-ASIC "
-                    "VID 0x21000000000000;\n"
-                    "      on a multi-ASIC (VoQ) box pass the real switch "
-                    "VID explicitly.\n");
-            }
-            if (options.debug) {
-                std::fprintf(
-                    stderr,
-                    "debug: transport at failure=%s; rerun with "
-                    "SAI_CAP_ENABLE_CLIENT=false|true|unset to bisect the "
-                    "transport\n",
-                    state->transport == Transport::Client ? "client"
-                                                          : "server");
-            }
-            sai_api_uninitialize();
-            return 3;
-        }
+        const SwitchProbeVerdict probe_verdict =
+            probe_exception.empty()
+                ? classify_switch_probe(status)
+                : SwitchProbeVerdict::Environmental;
 
-        std::fprintf(
-            banner,
-            "\nSwitch VID validation: OK (SAI_SWITCH_ATTR_TYPE=%s)\n",
-            format_enum_value(
-                type_metadata->enummetadata,
-                attribute.value.s32).c_str());
+        char oid_text[32];
+        std::snprintf(
+            oid_text,
+            sizeof(oid_text),
+            "0x%" PRIx64,
+            static_cast<uint64_t>(requested_switch));
+
+        switch (probe_verdict) {
+            case SwitchProbeVerdict::Ok:
+                std::fprintf(
+                    banner,
+                    "\nSwitch VID validation: OK "
+                    "(SAI_SWITCH_ATTR_TYPE=%s)\n",
+                    format_enum_value(
+                        type_metadata->enummetadata,
+                        attribute.value.s32).c_str());
+                break;
+
+            case SwitchProbeVerdict::InvalidOid:
+                std::fprintf(
+                    stderr,
+                    "\nFATAL: switch VID %s is not a valid live "
+                    "switch: %s\n"
+                    "Refusing to run capability queries, because every answer "
+                    "would be a false negative.\n"
+                    "Check the VID against ASIC_DB / syncd, and make sure the "
+                    "context config matches.\n",
+                    oid_text,
+                    format_status(status).c_str());
+                std::fprintf(
+                    stderr,
+                    "Triage on the switch:\n"
+                    "  is the VID in the view? redis-cli -n 1 HGETALL "
+                    "\"ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:oid:%s\"\n"
+                    "                          (ASIC_DB is database 1; view "
+                    "entries are per-object\n"
+                    "                           hashes under ASIC_STATE:; with "
+                    "syncd -u they may sit in\n"
+                    "                           TEMP_ASIC_STATE: until "
+                    "APPLY_VIEW)\n"
+                    "  which switches exist?  redis-cli -n 1 --scan --pattern "
+                    "'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*'\n"
+                    "  syncd serving ZMQ?      ps -o args= -C syncd   (-z zmq_sync "
+                    "is needed only by the opt-in client\n"
+                    "                          role, --client; -s is the "
+                    "deprecated redis_sync alias; the default Redis\n"
+                    "                          channel works against any syncd "
+                    "mode)\n"
+                    "  client endpoints?       ls -l /tmp/saiServer "
+                    "/tmp/saiServerNtf /tmp/zmq_ep /tmp/zmq_ntf_ep\n",
+                    oid_text);
+                if (options.switch_vid_defaulted) {
+                    std::fprintf(
+                        stderr,
+                        "NOTE: this run used the built-in default single-ASIC "
+                        "VID 0x21000000000000;\n"
+                        "      on a multi-ASIC (VoQ) box pass the real switch "
+                        "VID explicitly.\n");
+                }
+                if (options.debug) {
+                    std::fprintf(
+                        stderr,
+                        "debug: transport at failure=%s; rerun with "
+                        "SAI_CAP_ENABLE_CLIENT=false|true|unset to bisect the "
+                        "transport\n",
+                        state->transport == Transport::Client ? "client"
+                                                              : "server");
+                }
+                sai_api_uninitialize();
+                return 3;
+
+            case SwitchProbeVerdict::Environmental:
+                /*
+                 * The switch object is absent from the ASIC view this
+                 * process reaches (or the probe GET threw). The report
+                 * continues: capability queries are answered by the
+                 * adapter itself, and live switch-object reads failing is
+                 * visible in the report, not hidden behind an exit code.
+                 */
+                if (!probe_exception.empty()) {
+                    std::fprintf(
+                        banner,
+                        "\nWARNING: switch VID validation GET threw: %s\n",
+                        probe_exception.c_str());
+                } else {
+                    std::fprintf(
+                        banner,
+                        "\nWARNING: switch VID %s did not answer "
+                        "SAI_SWITCH_ATTR_TYPE: %s\n",
+                        oid_text,
+                        format_status(status).c_str());
+                }
+                std::fprintf(
+                    banner,
+                    "  The report continues: the capability queries below are "
+                    "answered by the adapter itself and are unaffected, but "
+                    "live reads of the switch object may all fail the same "
+                    "way.\n"
+                    "  Check the VID against ASIC_DB / syncd, and make sure "
+                    "the context config matches.\n"
+                    "  is the VID in the view? redis-cli -n 1 HGETALL "
+                    "\"ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:oid:%s\"\n"
+                    "                        (with syncd -u the view entries "
+                    "may sit in TEMP_ASIC_STATE:\n"
+                    "                         until APPLY_VIEW)\n"
+                    "  which switches exist? redis-cli -n 1 --scan --pattern "
+                    "'ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*'\n",
+                    oid_text);
+                if (options.switch_vid_defaulted) {
+                    std::fprintf(
+                        banner,
+                        "  NOTE: this run used the built-in default "
+                        "single-ASIC VID 0x21000000000000;\n"
+                        "        on a multi-ASIC (VoQ) box pass the real "
+                        "switch VID explicitly.\n");
+                }
+                if (options.debug) {
+                    std::fprintf(
+                        banner,
+                        "  debug: transport at failure=%s; rerun with "
+                        "SAI_CAP_ENABLE_CLIENT=false|true|unset to bisect "
+                        "the transport\n",
+                        state->transport == Transport::Client ? "client"
+                                                              : "server");
+                }
+                break;
+        }
     }
 
     if (options.response_timeout_ms != 0) {

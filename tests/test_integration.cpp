@@ -239,6 +239,34 @@ main(int argc, char **argv)
             "explicit override VID validates");
     }
 
+    /*
+     * 2d. A structurally valid switch oid that is absent from the ASIC view
+     *     answers the probe GET with SAI_STATUS_ITEM_NOT_FOUND, while the
+     *     adapter still answers the capability queries -- exactly what a
+     *     correct single-ASIC VID does on a box whose view is not APPLYed
+     *     yet (syncd -u keeps objects in TEMP_ASIC_STATE). The run must
+     *     warn and continue: this exact shape used to be a fatal exit-3
+     *     that threw the whole report away.
+     */
+    {
+        const std::string out = run("--object PORT 0x21000000000002");
+        expect_contains(
+            out, "WARNING: switch VID 0x21000000000002",
+            "view-absent VID warns");
+        expect_contains(
+            out, "did not answer SAI_SWITCH_ATTR_TYPE",
+            "the warning names the failed probe");
+        expect_not_contains(
+            out, "FATAL: switch VID",
+            "view-absent VID is not fatal");
+        expect_contains(
+            out, "Full attribute capability scan",
+            "view-absent VID still runs the capability scan");
+        expect_contains(
+            out, "[exit=0]",
+            "view-absent VID still produces a report");
+    }
+
     /* 3. Vendor range status must collapse into one normalized bucket. */
     {
         const std::string out = run("--all 0x21000000000000");

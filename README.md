@@ -70,8 +70,12 @@ answers exactly that key). A run without a VID targets it and the banner
 says `Switch VID: 0x21000000000000 (default)`.
 
 Pass an explicit VID on multi-ASIC (VoQ) boxes, where every asic has its
-own. If the default VID does not validate there, the exit-3 message says
-the built-in default was used and asks for the real VID.
+own. On such a box a wrong-but-well-formed VID answers the probe GET with
+`SAI_STATUS_ITEM_NOT_FOUND`: the run continues with a warning, and the
+capability queries themselves then fail visibly with
+`SAI_STATUS_INVALID_OBJECT_ID`, so the report cannot pass as "the ASIC
+supports nothing". Only an oid that is not a switch object at all is refused
+outright (exit 3).
 
 ### Exit codes
 
@@ -80,7 +84,15 @@ the built-in default was used and asks for the real VID.
 | 0 | report produced |
 | 1 | SAI initialization / transport-setup failure (including the ZMQ endpoint preflight, both roles) |
 | 2 | bad command line |
-| 3 | switch VID did not validate (refused to run) |
+| 3 | switch VID is structurally invalid (`SAI_STATUS_INVALID_OBJECT_ID`: not a switch oid at all, or an asic outside this context) and every capability query would fail the same way, so the report was refused |
+
+A switch oid that is merely **absent from the ASIC view** answers the probe
+GET with `SAI_STATUS_ITEM_NOT_FOUND` and is **not** fatal: the report runs
+with a prominent warning, because the capability queries are answered by the
+adapter itself and still work. That is what a correct single-ASIC VID does on
+a box whose view does not carry the switch yet (with `syncd -u` objects sit in
+`TEMP_ASIC_STATE:` until `APPLY_VIEW`), and an earlier build wrongly refused
+those runs with exit 3.
 
 ## Transport model (client vs server)
 
@@ -100,10 +112,11 @@ call on the other path fails: a client against an async syncd fails with
 `SAI_STATUS_FAILURE` on the first real operation (and
 `sai_query_api_version` answers `SAI_STATUS_NOT_IMPLEMENTED`, a client-side
 stub), while a server-role lookup of a switch object absent from the ASIC view
-fails with `SAI_STATUS_ITEM_NOT_FOUND`. A client-mode run without
-`--client-config` now preflights the built-in ZMQ endpoints before
-initializing (see *Debugging the transport*), so the common mistake fails in
-milliseconds instead of after the 60 s response timeout.
+fails with `SAI_STATUS_ITEM_NOT_FOUND` — a warning for the live-switch reads
+only, since the capability queries are still answered by the adapter. A
+client-mode run without `--client-config` now preflights the built-in ZMQ
+endpoints before initializing (see *Debugging the transport*), so the common
+mistake fails in milliseconds instead of after the 60 s response timeout.
 
 The client default introduced with `--client` support was a regression: a stock
 syncd (async, or `-s` redis_sync) serves no ZMQ endpoint at all, so the client
@@ -150,9 +163,11 @@ is the server role again, and the client role is the opt-in.
     (or `rm -f` on both endpoints if that server is already gone).
   * `SAI_CAP_ZMQ_PRECHECK=0` skips the preflight to observe the raw
     wait-and-fail behaviour.
-* Exit code 3 (the switch VID did not validate) now prints the on-switch
+* Exit code 3 (a structurally invalid switch VID) now prints the on-switch
   triage commands: whether the object is in the ASIC view, whether syncd
-  serves ZMQ, and whether the client endpoints exist.
+  serves ZMQ, and whether the client endpoints exist. A switch that is merely
+  absent from the ASIC view no longer exits 3 — it warns and continues,
+  because the capability queries still work.
 
 ### Containers and namespaces (SONiC / docker)
 
@@ -301,14 +316,22 @@ version addresses the highest-risk problems:
 2. **No unhandled exceptions.** libsairedis throws on malformed or unexpected
    responses. Every SAI call is now wrapped in `try`/`catch`.
 
-3. **Switch VID validation.** A wrong, expired, or wrong-context VID makes every
+3. **Switch VID probe.** A wrong, expired, or wrong-context VID makes every
    sairedis query fail with `INVALID_OBJECT_ID`; the old tool then printed a
-   full report that read as "the ASIC supports nothing". The VID is now
-   validated against the live switch before any capability query, and the tool
-   exits with code 3 if it does not validate. The VID itself is optional:
-   single-ASIC boxes all expose the same switch oid, so the tool defaults to it
-   instead of demanding the 16-digit value on every invocation (see *The switch
-   VID is optional* above).
+   full report that read as "the ASIC supports nothing". The VID is therefore
+   probed with one live `SAI_SWITCH_ATTR_TYPE` GET before any capability
+   query, and the verdict distinguishes the two failure shapes:
+   `SAI_STATUS_INVALID_OBJECT_ID` means the oid is not a switch object at
+   all, so the tool exits with code 3 and refuses the report; any other
+   failure — `SAI_STATUS_ITEM_NOT_FOUND` above all, which is what a correct
+   single-ASIC VID answers when the switch is absent from the ASIC view the
+   process reaches — only produces a warning and the report continues,
+   because the adapter answers the capability queries itself. (Treating
+   `ITEM_NOT_FOUND` as fatal was a regression: it made the tool exit 3 on a
+   perfectly good box.) The VID itself is optional: single-ASIC boxes all
+   expose the same switch oid, so the tool defaults to it instead of
+   demanding the 16-digit value on every invocation (see *The switch VID is
+   optional* above).
 
 4. **Skip vs. failure separation.** Attributes whose value types cannot be
    probed generically are counted as `skipped_by_tool`, never as adapter
